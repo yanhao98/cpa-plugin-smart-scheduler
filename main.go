@@ -192,22 +192,18 @@ func cliproxyPluginShutdown() {}
 
 func dispatch(op string, payload []byte) ([]byte, error) {
 	switch op {
-	case "lifecycle.register":
+	case "plugin.register":
 		return handleRegister(payload)
-	case "lifecycle.reconfigure":
+	case "plugin.reconfigure":
 		return handleReconfigure(payload)
-	case "lifecycle.health":
-		return okEnvelope(map[string]any{"healthy": true})
-	case "lifecycle.metrics":
-		return okEnvelope(map[string]any{})
-	case "management.register":
-		return handleManagementRegister()
-	case "management.handle":
-		return handleManagementHTTP(payload)
 	case "scheduler.pick":
 		return handlePickAuth(payload)
 	case "usage.handle":
 		return handleUsage(payload)
+	case "management.register":
+		return handleManagementRegister()
+	case "management.handle":
+		return handleManagementHTTP(payload)
 	default:
 		return errorEnvelope("unsupported_operation", fmt.Sprintf("unknown op: %s", op)), nil
 	}
@@ -237,11 +233,14 @@ func handleRegister(payload []byte) ([]byte, error) {
 	}
 
 	reg := map[string]any{
-		"name":        pluginName,
-		"version":     pluginVersion,
-		"description": "Production Decoupled P2C + Peak-EWMA Traffic Router & Envoy-Standard Outlier Detection Circuit Breaker",
-		"config_schema": map[string]any{
-			"fields": []map[string]any{
+		"schema_version": 1,
+		"metadata": map[string]any{
+			"Name":             "Smart TTFT & P2C Scheduler",
+			"Version":          pluginVersion,
+			"Author":           "yanhao98",
+			"GitHubRepository": "https://github.com/yanhao98/cpa-plugin-smart-scheduler",
+			"Description":      "Decoupled P2C + Peak-EWMA Traffic Router & Envoy-Standard Outlier Detection Circuit Breaker",
+			"ConfigFields": []map[string]any{
 				{
 					"Name":        "consecutive_gateway_failures",
 					"Type":        "int",
