@@ -2,7 +2,7 @@
 
 A native in-process C ABI scheduler and latency circuit-breaker plugin for [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI).
 
-Combines **P2C (Power of Two Choices) + Peak-EWMA latency load balancing** with **Half-Open Canary Probing**, eliminating external priority-script lag by dispatching requests at nanosecond speed in Go memory.
+Combines **P2C (Power of Two Choices) + Peak-EWMA latency load balancing** with **Half-Open Canary Probing**, dispatching requests at nanosecond speed directly in Go memory.
 
 > 📖 **Detailed Architecture & Scheduling Algorithm Documentation**: See [SCHEDULING_LOGIC.md](SCHEDULING_LOGIC.md).
 

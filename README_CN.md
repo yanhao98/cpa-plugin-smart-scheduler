@@ -2,7 +2,7 @@
 
 基于 [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI) 原生 C ABI 接口构建的**进程内智能首字延迟（TTFT）监控与高级调度熔断器插件**。
 
-融合了现代分布式网关与大模型网关顶尖的 **P2C (Power of Two Choices) + Peak-EWMA 最低延迟负载均衡** 以及 **Half-Open 金丝雀单笔试探熔断机制**，彻底告别外部脚本轮询改 priority 的滞后模式，在 Go 内存中实现单请求级的极致自适应分发。
+融合了现代分布式网关与大模型网关顶尖的 **P2C (Power of Two Choices) + Peak-EWMA 最低延迟负载均衡** 以及 **Half-Open 金丝雀单笔试探熔断机制**，在 Go 内存中实现单请求级的微秒级自适应分发。
 
 > 📖 **完整算法与全生命周期状态机设计文档**：请参阅 [SCHEDULING_LOGIC.md](SCHEDULING_LOGIC.md)。
 
