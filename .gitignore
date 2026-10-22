@@ -1,0 +1,6 @@
+*.so
+*.h
+*.zip
+*.tar.gz
+*.log
+.DS_Store

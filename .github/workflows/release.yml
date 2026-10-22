@@ -1,0 +1,85 @@
+name: Release Plugin
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build & Release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            ext: so
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            ext: dylib
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - name: Build C-Shared Library
+        env:
+          CGO_ENABLED: 1
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          go build -buildmode=c-shared -o cpa-plugin-smart-scheduler.${{ matrix.ext }} .
+
+      - name: Package Release Asset
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          VERSION="${TAG_NAME#v}"
+          ZIP_NAME="cpa-plugin-smart-scheduler_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.zip"
+          zip -j "$ZIP_NAME" cpa-plugin-smart-scheduler.${{ matrix.ext }}
+          sha256sum "$ZIP_NAME" > "${ZIP_NAME}.sha256"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: asset-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            *.zip
+            *.sha256
+
+  publish:
+    name: Publish GitHub Release
+    needs: build-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect Assets and Generate Checksums
+        run: |
+          mkdir -p release_assets
+          find artifacts -type f -name "*.zip" -exec cp {} release_assets/ \;
+          cd release_assets
+          sha256sum *.zip > checksums.txt
+          cat checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release_assets/*.zip
+            release_assets/checksums.txt
+          generate_release_notes: true
