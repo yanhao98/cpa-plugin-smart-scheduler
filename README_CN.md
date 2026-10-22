@@ -4,6 +4,8 @@
 
 融合了现代分布式网关与大模型网关顶尖的 **P2C (Power of Two Choices) + Peak-EWMA 最低延迟负载均衡** 以及 **Half-Open 金丝雀单笔试探熔断机制**，彻底告别外部脚本轮询改 priority 的滞后模式，在 Go 内存中实现单请求级的极致自适应分发。
 
+> 📖 **完整算法与全生命周期状态机设计文档**：请参阅 [SCHEDULING_LOGIC.md](SCHEDULING_LOGIC.md)。
+
 ---
 
 ## 核心架构与调度算法（v0.3.1）
