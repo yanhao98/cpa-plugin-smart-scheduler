@@ -55,7 +55,7 @@ import (
 
 const (
 	pluginName        = "cpa-plugin-smart-scheduler"
-	pluginVersion     = "0.3.0"
+	pluginVersion     = "0.3.1"
 	defaultMinSamples = 3
 	defaultSlowAvgMs  = 25000 // 25s
 	defaultHardMaxMs  = 90000 // 90s
@@ -437,6 +437,31 @@ func calculatePeakEWMACost(acc *AccountHealth) float64 {
 	return base * multiplier
 }
 
+// 动态解析 Google 上游返回的 RetryInfo 中的 retryDelay（如 "23s"）
+func parseGoogleRetryDelay(body string) time.Duration {
+	if body == "" {
+		return 30 * time.Second
+	}
+	var resp struct {
+		Error struct {
+			Details []struct {
+				Type       string `json:"@type"`
+				RetryDelay string `json:"retryDelay"`
+			} `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(body), &resp); err == nil {
+		for _, d := range resp.Error.Details {
+			if d.RetryDelay != "" {
+				if dur, err := time.ParseDuration(d.RetryDelay); err == nil && dur > 0 {
+					return dur
+				}
+			}
+		}
+	}
+	return 30 * time.Second // 兜底 30 秒
+}
+
 // 请求流式结束/失败回调：更新 TTFT、InFlight、熔断判定
 func handleUsage(payload []byte) ([]byte, error) {
 	var rec pluginapi.UsageRecord
@@ -492,9 +517,10 @@ func handleUsage(payload []byte) ([]byte, error) {
 
 	// 核心过滤 2：排除 503 MODEL_CAPACITY_EXHAUSTED（Google 服务器机房集群算力瞬时满载，非账号故障）
 	if rec.Failure.StatusCode == 503 && (strings.Contains(rec.Failure.Body, "MODEL_CAPACITY_EXHAUSTED") || strings.Contains(rec.Failure.Body, "No capacity")) {
-		// 账号完全无罪！不计入失败，不累积 flap，仅短暂避让 30 秒
-		acc.DemotedUntil = now.Add(30 * time.Second)
-		acc.DemotedReason = "Google上游集群算力瞬时满载(503 MODEL_CAPACITY_EXHAUSTED)，避让30s"
+		// 动态解析 Google 官方指示的精准冷却时长 (如 "23s")
+		delay := parseGoogleRetryDelay(rec.Failure.Body)
+		acc.DemotedUntil = now.Add(delay)
+		acc.DemotedReason = fmt.Sprintf("Google上游集群算力瞬时满载(503 MODEL_CAPACITY_EXHAUSTED)，动态避让%s", delay.Round(time.Second))
 		return okEnvelope(map[string]any{})
 	}
 

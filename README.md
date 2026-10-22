@@ -6,12 +6,12 @@ Combines **P2C (Power of Two Choices) + Peak-EWMA latency load balancing** with 
 
 ---
 
-## Architecture Highlights (v0.3.0)
+## Architecture Highlights (v0.3.1)
 
 1. **P2C + Peak-EWMA Routing (No Forced Idle for Mild Latency)**:
    Mild delays naturally inflate $\text{Cost} = \text{EWMA\_TTFT} \times (\text{InFlight} + 1)$, steering traffic to faster accounts without taking nodes offline.
 2. **503 MODEL_CAPACITY_EXHAUSTED Exemption**:
-   Exempts upstream capacity shortages from account penalties, applying only a 30-second backoff.
+   Exempts upstream capacity shortages from account penalties, dynamically extracting retryDelay from Google RetryInfo (e.g. 23s) for precise backoff.
 3. **Severe 5-Hour Circuit Breaking**:
    Single TTFT $\ge 90\text{s}$ or hard 429 rate limits isolate the account for 300 minutes (5 hours).
 4. **Half-Open Canary with 10-Hour Escalation**:
