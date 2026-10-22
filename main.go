@@ -55,12 +55,12 @@ import (
 
 const (
 	pluginName        = "cpa-plugin-smart-scheduler"
-	pluginVersion     = "0.2.0"
+	pluginVersion     = "0.3.0"
 	defaultMinSamples = 3
 	defaultSlowAvgMs  = 25000 // 25s
 	defaultHardMaxMs  = 90000 // 90s
-	defaultBaseQuietM = 90    // 90 minutes for mild slow (flap=1)
-	defaultDeepQuietM = 300   // 300 minutes (5h) for severe/repeat slow
+	defaultDeepQuietM = 300   // 300 minutes (5h) for first severe circuit break
+	defaultRetryQuietM = 600  // 600 minutes (10h) for canary retry failure
 	defaultMinActive  = 3
 	ewmaAlpha         = 0.3   // EWMA smoothing factor (0.3 for new sample, 0.7 for historical)
 )
@@ -79,8 +79,8 @@ type Config struct {
 	MinSamples            int  `yaml:"min_samples"`
 	SlowAvgMs             int  `yaml:"slow_avg_ms"`
 	HardMaxMs             int  `yaml:"hard_max_ms"`
-	BaseQuietMinutes      int  `yaml:"base_quiet_minutes"`
-	RepeatQuietMinutes    int  `yaml:"repeat_quiet_minutes"`
+	CooldownMinutes       int  `yaml:"cooldown_minutes"`
+	CanaryFailMinutes     int  `yaml:"canary_fail_minutes"`
 	MinActiveRatioPercent int  `yaml:"min_active_ratio_percent"`
 }
 
@@ -91,8 +91,8 @@ func defaultConfig() Config {
 		MinSamples:            defaultMinSamples,
 		SlowAvgMs:             defaultSlowAvgMs,
 		HardMaxMs:             defaultHardMaxMs,
-		BaseQuietMinutes:      defaultBaseQuietM,
-		RepeatQuietMinutes:    defaultDeepQuietM,
+		CooldownMinutes:       defaultDeepQuietM,
+		CanaryFailMinutes:     defaultRetryQuietM,
 		MinActiveRatioPercent: 30,
 	}
 }
@@ -229,7 +229,7 @@ func handleRegister(payload []byte) ([]byte, error) {
 					"Name":        "slow_avg_ms",
 					"Type":        "int",
 					"Default":     defaultSlowAvgMs,
-					"Description": "EWMA 首字延迟慢判定线（毫秒），默认 25000",
+					"Description": "EWMA 首字延迟慢判定线（毫秒），用于 P2C 动态降权分流，默认 25000",
 				},
 				{
 					"Name":        "hard_max_ms",
@@ -238,16 +238,16 @@ func handleRegister(payload []byte) ([]byte, error) {
 					"Description": "单笔极端慢硬熔断阈值（毫秒），默认 90000",
 				},
 				{
-					"Name":        "base_quiet_minutes",
-					"Type":        "int",
-					"Default":     defaultBaseQuietM,
-					"Description": "首次轻度慢静默时长（分钟），默认 90",
-				},
-				{
-					"Name":        "repeat_quiet_minutes",
+					"Name":        "cooldown_minutes",
 					"Type":        "int",
 					"Default":     defaultDeepQuietM,
-					"Description": "重复/恶性慢静默时长（分钟），默认 300 (5小时)",
+					"Description": "恶性慢/429/超时单笔熔断静默时长（分钟），默认 300 (5小时)",
+				},
+				{
+					"Name":        "canary_fail_minutes",
+					"Type":        "int",
+					"Default":     defaultRetryQuietM,
+					"Description": "金丝雀试水失败惩罚时长（分钟），默认 600 (10小时)",
 				},
 				{
 					"Name":        "min_active_ratio_percent",
@@ -490,43 +490,51 @@ func handleUsage(payload []byte) ([]byte, error) {
 		acc.Flap = 0
 	}
 
+	// 核心过滤 2：排除 503 MODEL_CAPACITY_EXHAUSTED（Google 服务器机房集群算力瞬时满载，非账号故障）
+	if rec.Failure.StatusCode == 503 && (strings.Contains(rec.Failure.Body, "MODEL_CAPACITY_EXHAUSTED") || strings.Contains(rec.Failure.Body, "No capacity")) {
+		// 账号完全无罪！不计入失败，不累积 flap，仅短暂避让 30 秒
+		acc.DemotedUntil = now.Add(30 * time.Second)
+		acc.DemotedReason = "Google上游集群算力瞬时满载(503 MODEL_CAPACITY_EXHAUSTED)，避让30s"
+		return okEnvelope(map[string]any{})
+	}
+
 	ttftMs := rec.TTFT.Milliseconds()
 	acc.LastTTFTMs = ttftMs
 
-	// 判定故障严重性
+	// 判定恶性故障：单笔极端慢(>=90s) 或 真429额度耗尽 或 严重超时断连(>=90s)
 	isHardSingle := ttftMs >= int64(cfg.HardMaxMs)
-	isSevereFail := rec.Failed && (rec.Failure.StatusCode == 429 || rec.Failure.StatusCode >= 500 || rec.Latency >= time.Duration(cfg.HardMaxMs)*time.Millisecond)
+	isSevereFail := rec.Failed && (rec.Failure.StatusCode == 429 || rec.Latency >= time.Duration(cfg.HardMaxMs)*time.Millisecond)
 
 	// 【Half-Open 金丝雀状态专属检验】
 	if acc.Status == StatusCanary {
 		if !rec.Failed && ttftMs > 0 && ttftMs < int64(cfg.SlowAvgMs) {
-			// 金丝雀单笔试水成功！首字 < 25s，证明 Google 慢队列已彻底退散，满血复活！
+			// 金丝雀单笔试水成功！首字 < 25s 且无报错，证明 Google 慢队列已彻底退散，满血转正！
 			acc.Status = StatusHealthy
 			acc.RestoredAt = now
 			acc.DemotedUntil = time.Time{}
 			acc.DemotedReason = ""
 			acc.EWMATTFTMs = float64(ttftMs)
 		} else {
-			// 金丝雀单笔试水失败或依然慢！立刻重新熔断，打入 300 分钟冷宫
+			// 金丝雀试水失败或依然慢：重度退避翻倍至 10 小时 (600 分钟)！
 			acc.TotalFails++
 			acc.Flap++
 			acc.Status = StatusCoolingDown
-			acc.DemotedUntil = now.Add(time.Duration(cfg.RepeatQuietMinutes) * time.Minute)
-			acc.DemotedReason = fmt.Sprintf("金丝雀试水未通过(首字 %dms, 失败=%v)，惩罚重置5h", ttftMs, rec.Failed)
+			acc.DemotedUntil = now.Add(time.Duration(cfg.CanaryFailMinutes) * time.Minute)
+			acc.DemotedReason = fmt.Sprintf("金丝雀试水未通过(首字 %dms, 失败=%v)，惩罚升级10h", ttftMs, rec.Failed)
 		}
 		return okEnvelope(map[string]any{})
 	}
 
-	// 【正常在岗账号的熔断判定】
+	// 【正常在岗账号的恶性故障熔断】
 	if isHardSingle || isSevereFail {
 		acc.TotalFails++
 		acc.Flap++
 		acc.Status = StatusCoolingDown
-		acc.DemotedUntil = now.Add(time.Duration(cfg.RepeatQuietMinutes) * time.Minute)
+		acc.DemotedUntil = now.Add(time.Duration(cfg.CooldownMinutes) * time.Minute)
 		if isHardSingle {
-			acc.DemotedReason = fmt.Sprintf("单笔极端慢首字 %dms(>=%dms)", ttftMs, cfg.HardMaxMs)
+			acc.DemotedReason = fmt.Sprintf("单笔极端慢首字 %dms(>=%dms)，触发5h熔断", ttftMs, cfg.HardMaxMs)
 		} else {
-			acc.DemotedReason = fmt.Sprintf("严重上游失败(状态码 %d)", rec.Failure.StatusCode)
+			acc.DemotedReason = fmt.Sprintf("真429/严重超时(状态码 %d)，触发5h熔断", rec.Failure.StatusCode)
 		}
 		return okEnvelope(map[string]any{})
 	}
@@ -536,24 +544,12 @@ func handleUsage(payload []byte) ([]byte, error) {
 		return okEnvelope(map[string]any{})
 	}
 
-	// 正常成功请求，更新 EWMA 首字平滑延迟
+	// 【正常在岗账号的平滑首字更新】：只更新 EWMA 供 P2C 算法动态降权，绝不关冷宫！
 	if ttftMs > 0 {
 		if acc.EWMATTFTMs <= 0 {
 			acc.EWMATTFTMs = float64(ttftMs)
 		} else {
 			acc.EWMATTFTMs = ewmaAlpha*float64(ttftMs) + (1-ewmaAlpha)*acc.EWMATTFTMs
-		}
-
-		// 检查 EWMA 滚动平均是否超出阈值 (>= 25s)
-		if acc.TotalRequests >= int64(cfg.MinSamples) && int64(acc.EWMATTFTMs) >= int64(cfg.SlowAvgMs) {
-			acc.Flap++
-			quietMinutes := cfg.BaseQuietMinutes // 90m
-			if acc.Flap >= 2 {
-				quietMinutes = cfg.RepeatQuietMinutes // 300m
-			}
-			acc.Status = StatusCoolingDown
-			acc.DemotedUntil = now.Add(time.Duration(quietMinutes) * time.Minute)
-			acc.DemotedReason = fmt.Sprintf("EWMA平滑首字 %dms(>=%dms), flap=%d", int64(acc.EWMATTFTMs), cfg.SlowAvgMs, acc.Flap)
 		}
 	}
 

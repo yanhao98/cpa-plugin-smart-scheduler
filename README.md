@@ -6,18 +6,20 @@ Combines **P2C (Power of Two Choices) + Peak-EWMA latency load balancing** with 
 
 ---
 
-## Architecture Highlights
+## Architecture Highlights (v0.3.0)
 
-1. **P2C + Peak-EWMA Routing**:
-   Samples 2 candidates randomly per request, evaluates $\text{Cost} = \text{EWMA\_TTFT} \times (\text{InFlight} + 1)$, and selects the lower-cost account to avoid hot-spotting and queue dogpiling.
-2. **Half-Open Canary Trial**:
-   Accounts waking up from cooling-down enter `canary` mode, allowing exactly 1 probe request. Promoted to `healthy` only if TTFT < 25s, protecting all other production traffic.
-3. **Model 404 Pool-Walk Immune**:
+1. **P2C + Peak-EWMA Routing (No Forced Idle for Mild Latency)**:
+   Mild delays naturally inflate $\text{Cost} = \text{EWMA\_TTFT} \times (\text{InFlight} + 1)$, steering traffic to faster accounts without taking nodes offline.
+2. **503 MODEL_CAPACITY_EXHAUSTED Exemption**:
+   Exempts upstream capacity shortages from account penalties, applying only a 30-second backoff.
+3. **Severe 5-Hour Circuit Breaking**:
+   Single TTFT $\ge 90\text{s}$ or hard 429 rate limits isolate the account for 300 minutes (5 hours).
+4. **Half-Open Canary with 10-Hour Escalation**:
+   Allows exactly 1 request to test recovery. Promotes to healthy on success; escalates to a 10-hour cooldown on repeat failure.
+5. **Model 404 Pool-Walk Immune**:
    Filters unentitled model 404 NOT_FOUND errors completely.
-4. **Dynamic Capacity Floor**:
+6. **Dynamic Capacity Floor**:
    Maintains $\ge 30\%$ active accounts to prevent empty-pool deadlock.
-5. **Embedded Diagnostic API**:
-   `/v0/management/plugins/cpa-plugin-smart-scheduler/status` exposes real-time in-flight concurrency, EWMA latencies, and cooldown countdowns.
 
 ---
 
@@ -35,8 +37,8 @@ plugins:
       priority: 1
       slow_avg_ms: 25000
       hard_max_ms: 90000
-      base_quiet_minutes: 90
-      repeat_quiet_minutes: 300
+      cooldown_minutes: 300
+      canary_fail_minutes: 600
       min_active_ratio_percent: 30
 ```
 
