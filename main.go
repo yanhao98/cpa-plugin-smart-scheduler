@@ -51,7 +51,7 @@ import (
 
 const (
 	pluginName                    = "cpa-plugin-smart-scheduler"
-	pluginVersion                 = "0.5.0"
+	pluginVersion                 = "0.5.1"
 	defaultConsecutiveFailures    = 3   // Envoy standard consecutive gateway failures
 	defaultBaseEjectionMinutes    = 300 // 300m (5 hours), Google Gemini quota window
 	defaultMaxEjectionMinutes     = 600 // 600m (10 hours), maximum backoff cap
@@ -357,14 +357,27 @@ func getFleetMeanEWMA(model string) (float64, bool) {
 // ==========================================
 // 子系统 1：按模型隔离的 P2C + Peak-EWMA 流量路由器 (Traffic Router)
 // 业界标准：Twitter Finagle / Linkerd
-// 彻底去除固定常数，采用动态集群均值与零偏置冷启动
+// 专精流式首字（TTFT），非流式走纯最小连接数（InFlight）
 // ==========================================
 
-func calculateModelCost(acc *AccountHealth, model string) float64 {
+func calculateModelCost(acc *AccountHealth, model string, stream bool) float64 {
 	if acc == nil {
 		return 1e9
 	}
 
+	// 🌟 非流式请求（stream = false）：
+	// 响应耗时由生成 Token 长度主导（5 tokens vs 2000 tokens），严禁用其污染延迟模型。
+	// 对于非流式，调度器采用纯粹的最小活跃连接数（Least Connections）均衡分发！
+	if !stream {
+		base := 1.0
+		if acc.Status == StatusCanary {
+			base = 0.8
+		}
+		return base * float64(acc.InFlight + 1)
+	}
+
+	// 🌟 流式请求（stream = true）：
+	// 专精纯粹的 TTFT（首字耗时 = Prefill 编码耗时 + 排队延迟，与输出长度彻底解耦）
 	var base float64
 	if acc.Models != nil {
 		if m, ok := acc.Models[model]; ok && m.TotalRequests > 0 && m.EWMATTFTMs > 0 {
@@ -504,8 +517,8 @@ func handlePickAuth(payload []byte) ([]byte, error) {
 		accA := globalState.accounts[candA.ID]
 		accB := globalState.accounts[candB.ID]
 
-		costA := calculateModelCost(accA, modelKey)
-		costB := calculateModelCost(accB, modelKey)
+		costA := calculateModelCost(accA, modelKey, req.Stream)
+		costB := calculateModelCost(accB, modelKey, req.Stream)
 
 		if costA <= costB {
 			selectedID = candA.ID
@@ -687,27 +700,32 @@ func handleUsage(payload []byte) ([]byte, error) {
 	}
 
 	// ----------------------------------------------------
-	// 成功请求处理：重置连续故障计数，按模型独立更新平滑延迟
+	// 成功请求处理：重置连续故障计数
 	// ----------------------------------------------------
 	acc.ConsecutiveFail = 0
-	ttftMs := rec.TTFT.Milliseconds()
-	if ttftMs > 0 {
-		m, ok := acc.Models[modelKey]
-		if !ok {
-			m = &ModelMetrics{}
-			acc.Models[modelKey] = m
-		}
-		m.LastTTFTMs = ttftMs
-		m.LastSeen = now
 
-		if m.TotalRequests == 0 || m.EWMATTFTMs <= 0 {
-			// 首包 100% 直接替换（First-Sample Replacement），严禁与伪种子掺水
-			m.EWMATTFTMs = float64(ttftMs)
-		} else {
-			alpha := cfg.EWMAAlpha
-			m.EWMATTFTMs = alpha*float64(ttftMs) + (1.0-alpha)*m.EWMATTFTMs
+	// 🌟 专精流式首字：只有流式请求（Stream == true）才会更新 EWMA TTFT！
+	// 非流式请求的总耗时受到生成 Token 数量的主导，绝对不计入首字平滑统计，彻底杜绝指标污染！
+	if rec.Stream {
+		ttftMs := rec.TTFT.Milliseconds()
+		if ttftMs > 0 {
+			m, ok := acc.Models[modelKey]
+			if !ok {
+				m = &ModelMetrics{}
+				acc.Models[modelKey] = m
+			}
+			m.LastTTFTMs = ttftMs
+			m.LastSeen = now
+
+			if m.TotalRequests == 0 || m.EWMATTFTMs <= 0 {
+				// 首包 100% 直接替换（First-Sample Replacement），严禁与伪种子掺水
+				m.EWMATTFTMs = float64(ttftMs)
+			} else {
+				alpha := cfg.EWMAAlpha
+				m.EWMATTFTMs = alpha*float64(ttftMs) + (1.0-alpha)*m.EWMATTFTMs
+			}
+			m.TotalRequests++
 		}
-		m.TotalRequests++
 	}
 
 	return okEnvelope(map[string]any{})

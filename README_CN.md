@@ -1,40 +1,44 @@
 # CPA 智能调度插件（cpa-plugin-smart-scheduler）
 
-基于 [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI) 原生 C ABI 接口构建的**按模型隔离的进程内智能流量路由与 Envoy 标准异常点熔断器插件**。
+基于 [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI) 原生 C ABI 接口构建的**专精流式首字（TTFT）与非流式最小连接数（Least Connections）双轨流量路由及 Envoy 标准异常点熔断器插件**。
 
-融合了现代分布式网关顶尖的 **按模型独立追踪的 P2C (Power of Two Choices) + Peak-EWMA 最低延迟负载均衡** 以及 **Envoy 标准 Outlier Detection 异常点熔断与半开金丝雀试探机制**，彻底清除任何人为硬编码常数，在 Go 内存中实现微秒级自适应分发。
+融合了现代分布式网关顶尖的 **按模型隔离与专精流式首字的 P2C (Power of Two Choices) + Peak-EWMA 最低延迟负载均衡** 以及 **Envoy 标准 Outlier Detection 异常点熔断与半开金丝雀试探机制**，彻底清除任何人为硬编码常数，在 Go 内存中实现微秒级自适应分发。
 
 > 📖 **完整算法与全生命周期状态机设计文档**：请参阅 [SCHEDULING_LOGIC.md](SCHEDULING_LOGIC.md)。
 
 ---
 
-## 核心架构与设计原则（v0.5.0）
+## 核心架构与设计原则（v0.5.1）
 
-### 1. 彻底去除人为硬编码常数（Zero Magic Numbers）
+### 1. 流式/非流式双轨制路由（Stream-Specialized Dual Track）
+- **物理本质**：大模型总耗时为 $\text{Prefill Time} + (\text{Output Tokens} \times \text{TPOT})$。非流式请求耗时（0.5s ~ 25s）受用户要求输出的文本长度决定，**绝不能代表节点真实延迟**；
+- **流式请求（`Stream = true`）**：专精纯净的 **TTFT 首字延迟**，不受输出长度影响，代入 P2C Peak-EWMA 代价公式精确避让慢节点；
+- **非流式请求（`Stream = false`）**：**绝不更新 EWMA 首字账本**，彻底杜绝长文生成污染延迟基准；调度时纯粹比对活跃并发数 `(InFlight + 1)`，自动退化为工业级**最小连接数（Least Connections）调度**。
+
+### 2. 彻底去除人为硬编码常数（Zero Magic Numbers）
 - **无固定初始延迟**：彻底废除任何硬编码的固定数字（如 8000ms），绝不因拍脑袋预估引发冷启动饥饿（Cold-Start Starvation）或羊群踩踏（Stampede）；
 - **动态集群均值（Dynamic Fleet Mean）**：新号冷启动时，动态继承当前号池在该模型上的真实平均首字延迟（$\text{Cost} = \text{FleetMean} \times 0.8$），赋予无害探索偏置；
 - **全冷启动中性基准**：若全池均未调用过该模型，所有账号基准完全一致（1.0），Cost 纯粹取决于活跃并发数 `(InFlight + 1)`，平滑退化为均匀随机 / 最小连接数探索；
-- **首包直接覆盖（First-Sample 100% Replacement）**：拿到第一笔真实响应耗时后，100% 直接替换初始基准，严禁与假种子掺水混合。
+- **首包直接覆盖（First-Sample 100% Replacement）**：拿到第一笔真实流式响应耗时后，100% 直接替换初始基准，严禁与假种子掺水混合。
 
-### 2. 按模型严格隔离延迟度量（Per-Model Latency Isolation）
-- **问题根源**：不同模型算力与思考形态差异巨大（极速小模型 1s vs 思考大模型 25s）。若按账号全局混算，一笔思考请求就会把该账号打上“极慢”标签，导致小模型请求被误杀冷落；
+### 3. 按模型严格隔离延迟度量（Per-Model Latency Isolation）
 - **模型级独立度量**：每个账号内部维护 `models: map[string]*ModelMetrics`，各模型独立记录首字延迟、平滑加权与请求计数；
 - **精确路由比对**：P2C 比对时，仅抽取两候选节点在**当前请求目标模型**上的综合代价进行择优：
   ```text
-  Cost(a, M) = BaseLatency(a, M) * (InFlight(a) + 1)
+  Cost(a, M, stream) = BaseScore(a, M, stream) * (InFlight(a) + 1)
   ```
 
-### 3. Envoy 标准异常点熔断（Outlier Detection）
-熔断器纯粹基于离散故障信号做出响应，不依赖任何主观延迟阈值：
+### 4. Envoy 标准异常点熔断（Outlier Detection）
+熔断器纯粹基于离散故障信号做出响应，流式与非流式一视同仁严格拦截：
 - **429 配额耗竭**：立即隔离 300 分钟（5 小时），精准覆盖 Google 滚动配额恢复周期；
 - **连续网关故障**：连续 3 次遇到 5xx 或网络断连，触发隔离 5 小时；单次偶发抖动不予惩罚。
 
-### 4. 上游语义感知与 503 机房满载豁免
+### 5. 上游语义感知与 503 机房满载豁免
 - 当 Google 返回 `503 MODEL_CAPACITY_EXHAUSTED` 时，插件自动动态提取响应体中 `google.rpc.RetryInfo.retryDelay` 字段（如 `"23s"`）进行精准避让；
 - **判定账号无过错**：不记入故障，不累积惩罚，避让结束后自动无缝恢复，彻底杜绝全网误杀；
 - 404 NOT_FOUND（未授权模型号池遍历）彻底免疫，零惩罚。
 
-### 5. Half-Open 金丝雀单笔试水与升级惩罚
+### 6. Half-Open 金丝雀单笔试水与升级惩罚
 ```text
 [Healthy 正常主力] ── 触发 429 / 连续 3 次故障 ──> [CoolingDown 隔离冷却 5 小时]
         ▲                                                │
@@ -49,7 +53,7 @@
 - **纯被动单笔放行**：隔离期满后转为 `Canary`，严格只放行 1 笔真实请求试水（零后台探活包）；
 - **二元检验准则**：只要请求成功完成（HTTP 2xx），无论耗时多少均判定解禁成功，立刻满血转正；若依然报错，触发指数退避，惩罚升级至 10 小时。
 
-### 6. Envoy 恐慌保底门限（Panic Threshold）
+### 7. Envoy 恐慌保底门限（Panic Threshold）
 - 当全池健康账号比例低于 30%（或少于 3 个）时，系统自动激活恐慌保底机制，借调最快解禁的隔离账号兜底，绝对防止号池全关导致服务雪崩。
 
 ---
