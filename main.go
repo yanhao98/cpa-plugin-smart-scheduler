@@ -40,6 +40,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/rand"
 	"net/http"
 	"sort"
 	"strings"
@@ -54,13 +55,22 @@ import (
 
 const (
 	pluginName        = "cpa-plugin-smart-scheduler"
-	pluginVersion     = "0.1.0"
+	pluginVersion     = "0.2.0"
 	defaultMinSamples = 3
 	defaultSlowAvgMs  = 25000 // 25s
 	defaultHardMaxMs  = 90000 // 90s
 	defaultBaseQuietM = 90    // 90 minutes for mild slow (flap=1)
 	defaultDeepQuietM = 300   // 300 minutes (5h) for severe/repeat slow
 	defaultMinActive  = 3
+	ewmaAlpha         = 0.3   // EWMA smoothing factor (0.3 for new sample, 0.7 for historical)
+)
+
+type AccountStatus string
+
+const (
+	StatusHealthy     AccountStatus = "healthy"
+	StatusCoolingDown AccountStatus = "cooling_down"
+	StatusCanary      AccountStatus = "canary" // Half-open probing state
 )
 
 type Config struct {
@@ -91,28 +101,30 @@ var currentConfig atomic.Value
 
 type AccountHealth struct {
 	AuthID          string        `json:"auth_id"`
-	RollingTTFT     []int64       `json:"rolling_ttft_ms,omitempty"`
+	Status          AccountStatus `json:"status"` // "healthy", "cooling_down", "canary"
+	InFlight        int64         `json:"in_flight"`
+	EWMATTFTMs      float64       `json:"ewma_ttft_ms"`
 	AvgTTFTMs       int64         `json:"avg_ttft_ms"`
 	LastTTFTMs      int64         `json:"last_ttft_ms"`
 	TotalRequests   int64         `json:"total_requests"`
 	TotalFails      int64         `json:"total_fails"`
-	DemotedUntil    time.Time     `json:"demoted_until"`
+	DemotedUntil    time.Time     `json:"demoted_until,omitempty"`
 	DemotedReason   string        `json:"demoted_reason,omitempty"`
 	Flap            int           `json:"flap"`
 	LastSeen        time.Time     `json:"last_seen"`
-	RestoredAt      time.Time     `json:"restored_at"`
-	Status          string        `json:"status"` // "healthy" or "cooling_down"
+	RestoredAt      time.Time     `json:"restored_at,omitempty"`
 	CooldownMinutes float64       `json:"cooldown_remaining_minutes,omitempty"`
 }
 
 type SchedulerState struct {
-	mu            sync.RWMutex
-	accounts      map[string]*AccountHealth
-	roundRobinIdx uint64
+	mu       sync.RWMutex
+	accounts map[string]*AccountHealth
+	rng      *rand.Rand
 }
 
 var globalState = &SchedulerState{
 	accounts: make(map[string]*AccountHealth),
+	rng:      rand.New(rand.NewSource(time.Now().UnixNano())),
 }
 
 type envelope struct {
@@ -207,35 +219,41 @@ func handleRegister(payload []byte) ([]byte, error) {
 	reg := map[string]any{
 		"schema_version": 1,
 		"metadata": map[string]any{
-			"Name":             "Smart TTFT Scheduler",
+			"Name":             "Smart TTFT & P2C Scheduler",
 			"Version":          pluginVersion,
 			"Author":           "yanhao98",
 			"GitHubRepository": "https://github.com/yanhao98/cpa-plugin-smart-scheduler",
-			"Description":      "智能首字延迟与熔断调度器：毫秒级实时统计首字延迟、排除404误判、90m/300m两段式静默退避与平滑调度。",
+			"Description":      "工业级大模型号池调度插件：P2C + Peak-EWMA 最低延迟负载均衡、Half-Open 金丝雀单笔试水探活、实时在飞并发追踪、排除404遍历、两段式 90m/300m 熔断。",
 			"ConfigFields": []map[string]any{
 				{
 					"Name":        "slow_avg_ms",
 					"Type":        "int",
 					"Default":     defaultSlowAvgMs,
-					"Description": "平均首字延迟慢判定阈值（毫秒），默认 25000",
+					"Description": "EWMA 首字延迟慢判定线（毫秒），默认 25000",
 				},
 				{
 					"Name":        "hard_max_ms",
 					"Type":        "int",
 					"Default":     defaultHardMaxMs,
-					"Description": "单笔极端慢首字硬熔断阈值（毫秒），默认 90000",
+					"Description": "单笔极端慢硬熔断阈值（毫秒），默认 90000",
 				},
 				{
 					"Name":        "base_quiet_minutes",
 					"Type":        "int",
 					"Default":     defaultBaseQuietM,
-					"Description": "首次轻度降级静默时长（分钟），默认 90",
+					"Description": "首次轻度慢静默时长（分钟），默认 90",
 				},
 				{
 					"Name":        "repeat_quiet_minutes",
 					"Type":        "int",
 					"Default":     defaultDeepQuietM,
-					"Description": "重复/恶性慢降级静默时长（分钟），默认 300 (5小时)",
+					"Description": "重复/恶性慢静默时长（分钟），默认 300 (5小时)",
+				},
+				{
+					"Name":        "min_active_ratio_percent",
+					"Type":        "int",
+					"Default":     30,
+					"Description": "全池最小活跃保底比例（%），默认 30%",
 				},
 			},
 		},
@@ -270,7 +288,7 @@ func applyConfig(payload []byte) error {
 	return nil
 }
 
-// 调度器选择逻辑
+// 调度核心：P2C (Power of Two Choices) + Peak-EWMA + Half-Open 金丝雀探活
 func handleSchedulerPick(payload []byte) ([]byte, error) {
 	var req pluginapi.SchedulerPickRequest
 	if err := json.Unmarshal(payload, &req); err != nil {
@@ -290,37 +308,48 @@ func handleSchedulerPick(payload []byte) ([]byte, error) {
 	globalState.mu.Lock()
 	defer globalState.mu.Unlock()
 
-	// 1. 分类候选账号：健康在线 vs 冷却中
-	var healthyCandidates []pluginapi.SchedulerAuthCandidate
+	var eligibleCandidates []pluginapi.SchedulerAuthCandidate
 	var coolingCandidates []*AccountHealth
 
+	// 1. 状态流转与候选资格筛选
 	for _, cand := range req.Candidates {
 		acc, exists := globalState.accounts[cand.ID]
 		if !exists {
 			acc = &AccountHealth{
-				AuthID:   cand.ID,
-				Status:   "healthy",
-				LastSeen: now,
+				AuthID:     cand.ID,
+				Status:     StatusHealthy,
+				EWMATTFTMs: 8000, // 初始预估 8s
+				LastSeen:   now,
 			}
 			globalState.accounts[cand.ID] = acc
 		}
 
-		// 检查冷却状态
-		if now.Before(acc.DemotedUntil) {
-			coolingCandidates = append(coolingCandidates, acc)
-		} else {
-			if acc.Status == "cooling_down" {
-				// 冷却期满自然恢复
-				acc.Status = "healthy"
-				acc.RestoredAt = now
-				acc.DemotedUntil = time.Time{}
-				acc.DemotedReason = ""
+		if acc.Status == StatusCoolingDown {
+			if now.After(acc.DemotedUntil) {
+				// 静默期满：转入 Half-Open 金丝雀试水状态！
+				acc.Status = StatusCanary
+				acc.DemotedReason = "冷却期满，进入金丝雀单笔试水状态"
+			} else {
+				coolingCandidates = append(coolingCandidates, acc)
+				continue
 			}
-			healthyCandidates = append(healthyCandidates, cand)
+		}
+
+		if acc.Status == StatusCanary {
+			// 金丝雀状态保护：只允许放行 1 笔请求试水！
+			if acc.InFlight == 0 {
+				eligibleCandidates = append(eligibleCandidates, cand)
+			}
+			continue
+		}
+
+		// 正常健康账号
+		if acc.Status == StatusHealthy {
+			eligibleCandidates = append(eligibleCandidates, cand)
 		}
 	}
 
-	// 2. 保底检查：若健康候选数少于动态保底量，唤醒最接近恢复的账号补充
+	// 2. 动态保底容量防御：防止极度恶劣情况下号池被全部降空
 	minActive := int(math.Ceil(float64(len(req.Candidates)) * float64(cfg.MinActiveRatioPercent) / 100.0))
 	if minActive < defaultMinActive {
 		minActive = defaultMinActive
@@ -329,44 +358,86 @@ func handleSchedulerPick(payload []byte) ([]byte, error) {
 		minActive = len(req.Candidates)
 	}
 
-	if len(healthyCandidates) < minActive && len(coolingCandidates) > 0 {
-		// 按冷却截止时间升序排序（最快恢复的排前）
+	if len(eligibleCandidates) < minActive && len(coolingCandidates) > 0 {
+		// 按冷却截止时间升序排序（最快将要恢复的排前）
 		sort.Slice(coolingCandidates, func(i, j int) bool {
 			return coolingCandidates[i].DemotedUntil.Before(coolingCandidates[j].DemotedUntil)
 		})
 
-		needed := minActive - len(healthyCandidates)
+		needed := minActive - len(eligibleCandidates)
 		for i := 0; i < needed && i < len(coolingCandidates); i++ {
 			cAcc := coolingCandidates[i]
 			for _, cand := range req.Candidates {
 				if cand.ID == cAcc.AuthID {
-					healthyCandidates = append(healthyCandidates, cand)
+					eligibleCandidates = append(eligibleCandidates, cand)
 					break
 				}
 			}
 		}
 	}
 
-	if len(healthyCandidates) == 0 {
-		// 极端兜底，让宿主默认逻辑处理
+	if len(eligibleCandidates) == 0 {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 	}
 
-	// 3. 智能选择：在健康候选者中，按平滑轮询（Round-Robin）分发
-	idx := atomic.AddUint64(&globalState.roundRobinIdx, 1)
-	selected := healthyCandidates[idx%uint64(len(healthyCandidates))]
+	// 3. P2C (Power of Two Choices) 路由决策算法
+	// 从候选池中随机抽取 2 个账号，计算 Score = EWMA_TTFT * (InFlight + 1)，选择代价更小的账号
+	var selectedID string
+	if len(eligibleCandidates) == 1 {
+		selectedID = eligibleCandidates[0].ID
+	} else {
+		// 随机挑选两个不同候选者
+		i := globalState.rng.Intn(len(eligibleCandidates))
+		j := globalState.rng.Intn(len(eligibleCandidates) - 1)
+		if j >= i {
+			j++
+		}
+		candA := eligibleCandidates[i]
+		candB := eligibleCandidates[j]
 
-	if acc, ok := globalState.accounts[selected.ID]; ok {
+		accA := globalState.accounts[candA.ID]
+		accB := globalState.accounts[candB.ID]
+
+		costA := calculatePeakEWMACost(accA)
+		costB := calculatePeakEWMACost(accB)
+
+		if costA <= costB {
+			selectedID = candA.ID
+		} else {
+			selectedID = candB.ID
+		}
+	}
+
+	// 记录在飞并发数递增
+	if acc, ok := globalState.accounts[selectedID]; ok {
+		acc.InFlight++
 		acc.LastSeen = now
 	}
 
 	return okEnvelope(pluginapi.SchedulerPickResponse{
-		AuthID:  selected.ID,
+		AuthID:  selectedID,
 		Handled: true,
 	})
 }
 
-// 接收用量及延迟事件
+// P2C 成本计算公式：Cost = EWMA_TTFT * (InFlight + 1)
+func calculatePeakEWMACost(acc *AccountHealth) float64 {
+	if acc == nil {
+		return 100000.0
+	}
+	base := acc.EWMATTFTMs
+	if base <= 0 {
+		base = 8000.0 // 默认 8s
+	}
+	// 金丝雀试水账号稍微增加一点探测优先级，便于早点完成试水
+	multiplier := float64(acc.InFlight + 1)
+	if acc.Status == StatusCanary {
+		return base * 0.9 * multiplier
+	}
+	return base * multiplier
+}
+
+// 请求流式结束/失败回调：更新 TTFT、InFlight、熔断判定
 func handleUsage(payload []byte) ([]byte, error) {
 	var rec pluginapi.UsageRecord
 	if err := json.Unmarshal(payload, &rec); err != nil {
@@ -378,8 +449,15 @@ func handleUsage(payload []byte) ([]byte, error) {
 		return okEnvelope(map[string]any{})
 	}
 
-	// 核心过滤：排除 404 NOT_FOUND（模型未授权遍历不是账号故障）
+	// 核心过滤：彻底排除 404 NOT_FOUND（未授权模型号池遍历绝不计入故障）
 	if rec.Failure.StatusCode == 404 {
+		globalState.mu.Lock()
+		if acc, ok := globalState.accounts[authID]; ok {
+			if acc.InFlight > 0 {
+				acc.InFlight--
+			}
+		}
+		globalState.mu.Unlock()
 		return okEnvelope(map[string]any{})
 	}
 
@@ -392,33 +470,59 @@ func handleUsage(payload []byte) ([]byte, error) {
 	acc, exists := globalState.accounts[authID]
 	if !exists {
 		acc = &AccountHealth{
-			AuthID:   authID,
-			Status:   "healthy",
-			LastSeen: now,
+			AuthID:     authID,
+			Status:     StatusHealthy,
+			EWMATTFTMs: 8000,
+			LastSeen:   now,
 		}
 		globalState.accounts[authID] = acc
+	}
+
+	// 在飞并发计数归还
+	if acc.InFlight > 0 {
+		acc.InFlight--
 	}
 	acc.TotalRequests++
 	acc.LastSeen = now
 
-	// 自愈机制：若账号稳定处于健康态满 12 小时且零报错，重置 flap
-	if acc.Status == "healthy" && !acc.RestoredAt.IsZero() && now.Sub(acc.RestoredAt) >= 12*time.Hour {
+	// 长期健康自愈：账号在 Healthy 状态下连续稳定运行满 12 小时，重置抖动计数 flap
+	if acc.Status == StatusHealthy && !acc.RestoredAt.IsZero() && now.Sub(acc.RestoredAt) >= 12*time.Hour {
 		acc.Flap = 0
 	}
 
 	ttftMs := rec.TTFT.Milliseconds()
 	acc.LastTTFTMs = ttftMs
 
-	// 1. 单笔极端慢硬熔断 (>= 90s) 或严重系统失败 (504/499)
+	// 判定故障严重性
 	isHardSingle := ttftMs >= int64(cfg.HardMaxMs)
 	isSevereFail := rec.Failed && (rec.Failure.StatusCode == 429 || rec.Failure.StatusCode >= 500 || rec.Latency >= time.Duration(cfg.HardMaxMs)*time.Millisecond)
 
+	// 【Half-Open 金丝雀状态专属检验】
+	if acc.Status == StatusCanary {
+		if !rec.Failed && ttftMs > 0 && ttftMs < int64(cfg.SlowAvgMs) {
+			// 金丝雀单笔试水成功！首字 < 25s，证明 Google 慢队列已彻底退散，满血复活！
+			acc.Status = StatusHealthy
+			acc.RestoredAt = now
+			acc.DemotedUntil = time.Time{}
+			acc.DemotedReason = ""
+			acc.EWMATTFTMs = float64(ttftMs)
+		} else {
+			// 金丝雀单笔试水失败或依然慢！立刻重新熔断，打入 300 分钟冷宫
+			acc.TotalFails++
+			acc.Flap++
+			acc.Status = StatusCoolingDown
+			acc.DemotedUntil = now.Add(time.Duration(cfg.RepeatQuietMinutes) * time.Minute)
+			acc.DemotedReason = fmt.Sprintf("金丝雀试水未通过(首字 %dms, 失败=%v)，惩罚重置5h", ttftMs, rec.Failed)
+		}
+		return okEnvelope(map[string]any{})
+	}
+
+	// 【正常在岗账号的熔断判定】
 	if isHardSingle || isSevereFail {
 		acc.TotalFails++
 		acc.Flap++
-		quietMinutes := cfg.RepeatQuietMinutes // 300m (5h)
-		acc.Status = "cooling_down"
-		acc.DemotedUntil = now.Add(time.Duration(quietMinutes) * time.Minute)
+		acc.Status = StatusCoolingDown
+		acc.DemotedUntil = now.Add(time.Duration(cfg.RepeatQuietMinutes) * time.Minute)
 		if isHardSingle {
 			acc.DemotedReason = fmt.Sprintf("单笔极端慢首字 %dms(>=%dms)", ttftMs, cfg.HardMaxMs)
 		} else {
@@ -432,29 +536,24 @@ func handleUsage(payload []byte) ([]byte, error) {
 		return okEnvelope(map[string]any{})
 	}
 
-	// 2. 正常成功请求，记录滚动 TTFT
+	// 正常成功请求，更新 EWMA 首字平滑延迟
 	if ttftMs > 0 {
-		acc.RollingTTFT = append(acc.RollingTTFT, ttftMs)
-		if len(acc.RollingTTFT) > 20 {
-			acc.RollingTTFT = acc.RollingTTFT[len(acc.RollingTTFT)-20:]
+		if acc.EWMATTFTMs <= 0 {
+			acc.EWMATTFTMs = float64(ttftMs)
+		} else {
+			acc.EWMATTFTMs = ewmaAlpha*float64(ttftMs) + (1-ewmaAlpha)*acc.EWMATTFTMs
 		}
 
-		var sum int64
-		for _, v := range acc.RollingTTFT {
-			sum += v
-		}
-		acc.AvgTTFTMs = sum / int64(len(acc.RollingTTFT))
-
-		// 检查平均耗时是否触发轻度慢降级 (>= 25s)
-		if len(acc.RollingTTFT) >= cfg.MinSamples && acc.AvgTTFTMs >= int64(cfg.SlowAvgMs) {
+		// 检查 EWMA 滚动平均是否超出阈值 (>= 25s)
+		if acc.TotalRequests >= int64(cfg.MinSamples) && int64(acc.EWMATTFTMs) >= int64(cfg.SlowAvgMs) {
 			acc.Flap++
 			quietMinutes := cfg.BaseQuietMinutes // 90m
 			if acc.Flap >= 2 {
 				quietMinutes = cfg.RepeatQuietMinutes // 300m
 			}
-			acc.Status = "cooling_down"
+			acc.Status = StatusCoolingDown
 			acc.DemotedUntil = now.Add(time.Duration(quietMinutes) * time.Minute)
-			acc.DemotedReason = fmt.Sprintf("平均首字 %dms(>=%dms), flap=%d", acc.AvgTTFTMs, cfg.SlowAvgMs, acc.Flap)
+			acc.DemotedReason = fmt.Sprintf("EWMA平滑首字 %dms(>=%dms), flap=%d", int64(acc.EWMATTFTMs), cfg.SlowAvgMs, acc.Flap)
 		}
 	}
 
@@ -474,7 +573,7 @@ func handleManagementRegister() ([]byte, error) {
 	return okEnvelope(routes)
 }
 
-// 管理路由响应
+// 管理端点：实时查看内存中每个账号的健康状态、在飞并发、EWMA延迟
 func handleManagementHandle(payload []byte) ([]byte, error) {
 	now := time.Now()
 	globalState.mu.RLock()
@@ -483,18 +582,20 @@ func handleManagementHandle(payload []byte) ([]byte, error) {
 	list := make([]AccountHealth, 0, len(globalState.accounts))
 	for _, acc := range globalState.accounts {
 		item := *acc
-		if now.Before(item.DemotedUntil) {
-			item.Status = "cooling_down"
-			item.CooldownMinutes = math.Round(item.DemotedUntil.Sub(now).Minutes()*10) / 10
-		} else {
-			item.Status = "healthy"
-			item.CooldownMinutes = 0
+		if item.Status == StatusCoolingDown {
+			if now.Before(item.DemotedUntil) {
+				item.CooldownMinutes = math.Round(item.DemotedUntil.Sub(now).Minutes()*10) / 10
+			} else {
+				item.Status = StatusCanary
+				item.CooldownMinutes = 0
+			}
 		}
+		item.AvgTTFTMs = int64(math.Round(item.EWMATTFTMs))
 		list = append(list, item)
 	}
 
 	sort.Slice(list, func(i, j int) bool {
-		return list[i].AvgTTFTMs > list[j].AvgTTFTMs
+		return list[i].AvgTTFTMs < list[j].AvgTTFTMs
 	})
 
 	data, _ := json.Marshal(map[string]any{
