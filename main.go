@@ -3,24 +3,20 @@ package main
 /*
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 typedef struct {
-	void* ptr;
+	void *data;
 	size_t len;
+	size_t cap;
 } cliproxy_buffer;
-
-typedef int (*cliproxy_host_call_fn)(void*, const char*, const uint8_t*, size_t, cliproxy_buffer*);
-typedef void (*cliproxy_host_free_fn)(void*, size_t);
 
 typedef struct {
 	uint32_t abi_version;
-	void* host_ctx;
-	cliproxy_host_call_fn call;
-	cliproxy_host_free_fn free_buffer;
 } cliproxy_host_api;
 
-typedef int (*cliproxy_plugin_call_fn)(char*, uint8_t*, size_t, cliproxy_buffer*);
-typedef void (*cliproxy_plugin_free_fn)(void*, size_t);
+typedef int (*cliproxy_plugin_call_fn)(const char *op, const uint8_t *in, size_t in_len, cliproxy_buffer *out);
+typedef void (*cliproxy_plugin_free_fn)(void *ptr, size_t size);
 typedef void (*cliproxy_plugin_shutdown_fn)(void);
 
 typedef struct {
@@ -54,15 +50,14 @@ import (
 )
 
 const (
-	pluginName        = "cpa-plugin-smart-scheduler"
-	pluginVersion     = "0.3.1"
-	defaultMinSamples = 3
-	defaultSlowAvgMs  = 25000 // 25s
-	defaultHardMaxMs  = 90000 // 90s
-	defaultDeepQuietM = 300   // 300 minutes (5h) for first severe circuit break
-	defaultRetryQuietM = 600  // 600 minutes (10h) for canary retry failure
-	defaultMinActive  = 3
-	ewmaAlpha         = 0.3   // EWMA smoothing factor (0.3 for new sample, 0.7 for historical)
+	pluginName                    = "cpa-plugin-smart-scheduler"
+	pluginVersion                 = "0.4.0"
+	defaultConsecutiveFailures    = 3      // Envoy standard consecutive gateway failures
+	defaultBaseEjectionMinutes    = 300    // 300m (5 hours), Google Gemini quota window
+	defaultMaxEjectionMinutes     = 600    // 600m (10 hours), maximum backoff cap
+	defaultPanicThresholdPercent  = 30     // Envoy healthy_panic_threshold (minimum 30% active accounts)
+	defaultMinActive              = 3      // Minimum active accounts floor
+	defaultEWMAAlpha              = 0.3    // Exponential smoothing factor for TTFT
 )
 
 type AccountStatus string
@@ -74,26 +69,24 @@ const (
 )
 
 type Config struct {
-	Enabled               bool `yaml:"enabled"`
-	Priority              int  `yaml:"priority"`
-	MinSamples            int  `yaml:"min_samples"`
-	SlowAvgMs             int  `yaml:"slow_avg_ms"`
-	HardMaxMs             int  `yaml:"hard_max_ms"`
-	CooldownMinutes       int  `yaml:"cooldown_minutes"`
-	CanaryFailMinutes     int  `yaml:"canary_fail_minutes"`
-	MinActiveRatioPercent int  `yaml:"min_active_ratio_percent"`
+	Enabled                    bool    `yaml:"enabled"`
+	Priority                   int     `yaml:"priority"`
+	ConsecutiveGatewayFailures int     `yaml:"consecutive_gateway_failures"`
+	BaseEjectionMinutes        int     `yaml:"base_ejection_minutes"`
+	MaxEjectionMinutes         int     `yaml:"max_ejection_minutes"`
+	PanicThresholdPercent      int     `yaml:"panic_threshold_percent"`
+	EWMAAlpha                  float64 `yaml:"ewma_alpha"`
 }
 
 func defaultConfig() Config {
 	return Config{
-		Enabled:               true,
-		Priority:              1,
-		MinSamples:            defaultMinSamples,
-		SlowAvgMs:             defaultSlowAvgMs,
-		HardMaxMs:             defaultHardMaxMs,
-		CooldownMinutes:       defaultDeepQuietM,
-		CanaryFailMinutes:     defaultRetryQuietM,
-		MinActiveRatioPercent: 30,
+		Enabled:                    true,
+		Priority:                   1,
+		ConsecutiveGatewayFailures: defaultConsecutiveFailures,
+		BaseEjectionMinutes:        defaultBaseEjectionMinutes,
+		MaxEjectionMinutes:         defaultMaxEjectionMinutes,
+		PanicThresholdPercent:      defaultPanicThresholdPercent,
+		EWMAAlpha:                  defaultEWMAAlpha,
 	}
 }
 
@@ -104,10 +97,10 @@ type AccountHealth struct {
 	Status          AccountStatus `json:"status"` // "healthy", "cooling_down", "canary"
 	InFlight        int64         `json:"in_flight"`
 	EWMATTFTMs      float64       `json:"ewma_ttft_ms"`
-	AvgTTFTMs       int64         `json:"avg_ttft_ms"`
 	LastTTFTMs      int64         `json:"last_ttft_ms"`
 	TotalRequests   int64         `json:"total_requests"`
 	TotalFails      int64         `json:"total_fails"`
+	ConsecutiveFail int           `json:"consecutive_fails"`
 	DemotedUntil    time.Time     `json:"demoted_until,omitempty"`
 	DemotedReason   string        `json:"demoted_reason,omitempty"`
 	Flap            int           `json:"flap"`
@@ -152,35 +145,38 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 		return 1
 	}
 	plugin.abi_version = 1
-	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
-	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
-	plugin.shutdown = C.cliproxy_plugin_shutdown_fn(C.cliproxyPluginShutdown)
+	plugin.call = (C.cliproxy_plugin_call_fn)(C.cliproxyPluginCall)
+	plugin.free_buffer = (C.cliproxy_plugin_free_fn)(C.cliproxyPluginFree)
+	plugin.shutdown = (C.cliproxy_plugin_shutdown_fn)(C.cliproxyPluginShutdown)
 	return 0
 }
 
 //export cliproxyPluginCall
-func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) C.int {
-	if response != nil {
-		response.ptr = nil
-		response.len = 0
-	}
-	if method == nil {
-		writeResponse(response, errorEnvelope("invalid_method", "method is required"))
+func cliproxyPluginCall(cOp *C.char, inPtr *C.uint8_t, inLen C.size_t, outBuf *C.cliproxy_buffer) C.int {
+	if outBuf == nil {
 		return 1
 	}
-
-	m := C.GoString(method)
-	var reqBytes []byte
-	if request != nil && requestLen > 0 {
-		reqBytes = C.GoBytes(unsafe.Pointer(request), C.int(requestLen))
+	op := C.GoString(cOp)
+	var in []byte
+	if inLen > 0 && inPtr != nil {
+		in = C.GoBytes(unsafe.Pointer(inPtr), C.int(inLen))
 	}
 
-	raw, errHandle := handleMethod(m, reqBytes)
-	if errHandle != nil {
-		writeResponse(response, errorEnvelope("plugin_error", errHandle.Error()))
+	res, err := dispatch(op, in)
+	if err != nil {
 		return 1
 	}
-	writeResponse(response, raw)
+	if len(res) == 0 {
+		outBuf.data = nil
+		outBuf.len = 0
+		outBuf.cap = 0
+		return 0
+	}
+
+	cData := C.CBytes(res)
+	outBuf.data = cData
+	outBuf.len = C.size_t(len(res))
+	outBuf.cap = C.size_t(len(res))
 	return 0
 }
 
@@ -189,71 +185,92 @@ func cliproxyPluginFree(ptr unsafe.Pointer, size C.size_t) {
 	if ptr != nil {
 		C.free(ptr)
 	}
-	_ = size
 }
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {}
 
-func handleMethod(method string, payload []byte) ([]byte, error) {
-	switch method {
-	case "plugin.register":
+func dispatch(op string, payload []byte) ([]byte, error) {
+	switch op {
+	case "lifecycle.register":
 		return handleRegister(payload)
-	case "plugin.reconfigure":
+	case "lifecycle.reconfigure":
 		return handleReconfigure(payload)
-	case "scheduler.pick":
-		return handleSchedulerPick(payload)
-	case "usage.handle":
-		return handleUsage(payload)
+	case "lifecycle.health":
+		return okEnvelope(map[string]any{"healthy": true})
+	case "lifecycle.metrics":
+		return okEnvelope(map[string]any{})
 	case "management.register":
 		return handleManagementRegister()
 	case "management.handle":
-		return handleManagementHandle(payload)
+		return handleManagementHTTP(payload)
+	case "scheduler.pick":
+		return handlePickAuth(payload)
+	case "usage.handle":
+		return handleUsage(payload)
 	default:
-		return errorEnvelope("unknown_method", "method not supported: "+method), nil
+		return errorEnvelope("unsupported_operation", fmt.Sprintf("unknown op: %s", op)), nil
 	}
 }
 
+func okEnvelope(val any) ([]byte, error) {
+	b, err := json.Marshal(val)
+	if err != nil {
+		return nil, err
+	}
+	env := envelope{OK: true, Result: b}
+	return json.Marshal(env)
+}
+
+func errorEnvelope(code, msg string) []byte {
+	env := envelope{
+		OK:    false,
+		Error: &envelopeError{Code: code, Message: msg},
+	}
+	b, _ := json.Marshal(env)
+	return b
+}
+
 func handleRegister(payload []byte) ([]byte, error) {
-	_ = applyConfig(payload)
+	if err := applyConfig(payload); err != nil {
+		return errorEnvelope("invalid_config", err.Error()), nil
+	}
+
 	reg := map[string]any{
-		"schema_version": 1,
-		"metadata": map[string]any{
-			"Name":             "Smart TTFT & P2C Scheduler",
-			"Version":          pluginVersion,
-			"Author":           "yanhao98",
-			"GitHubRepository": "https://github.com/yanhao98/cpa-plugin-smart-scheduler",
-			"Description":      "工业级大模型号池调度插件：P2C + Peak-EWMA 最低延迟负载均衡、Half-Open 金丝雀单笔试水探活、实时在飞并发追踪、排除404遍历、两段式 90m/300m 熔断。",
-			"ConfigFields": []map[string]any{
+		"name":        pluginName,
+		"version":     pluginVersion,
+		"description": "Production Decoupled P2C + Peak-EWMA Traffic Router & Envoy-Standard Outlier Detection Circuit Breaker",
+		"config_schema": map[string]any{
+			"fields": []map[string]any{
 				{
-					"Name":        "slow_avg_ms",
+					"Name":        "consecutive_gateway_failures",
 					"Type":        "int",
-					"Default":     defaultSlowAvgMs,
-					"Description": "EWMA 首字延迟慢判定线（毫秒），用于 P2C 动态降权分流，默认 25000",
+					"Default":     defaultConsecutiveFailures,
+					"Description": "Envoy 标准连续网关故障熔断门限（5xx/断连），默认 3",
 				},
 				{
-					"Name":        "hard_max_ms",
+					"Name":        "base_ejection_minutes",
 					"Type":        "int",
-					"Default":     defaultHardMaxMs,
-					"Description": "单笔极端慢硬熔断阈值（毫秒），默认 90000",
+					"Default":     defaultBaseEjectionMinutes,
+					"Description": "基础熔断隔离时长（分钟），默认 300 (5小时对齐 Google 配额窗口)",
 				},
 				{
-					"Name":        "cooldown_minutes",
+					"Name":        "max_ejection_minutes",
 					"Type":        "int",
-					"Default":     defaultDeepQuietM,
-					"Description": "恶性慢/429/超时单笔熔断静默时长（分钟），默认 300 (5小时)",
+					"Default":     defaultMaxEjectionMinutes,
+					"Description": "最大熔断隔离上限时长（分钟），默认 600 (10小时)",
 				},
 				{
-					"Name":        "canary_fail_minutes",
+					"Name":        "panic_threshold_percent",
 					"Type":        "int",
-					"Default":     defaultRetryQuietM,
-					"Description": "金丝雀试水失败惩罚时长（分钟），默认 600 (10小时)",
+					"Default":     defaultPanicThresholdPercent,
+					"Description": "Envoy 标准恐慌保底门限百分比（%），默认 30%",
 				},
 				{
-					"Name":        "min_active_ratio_percent",
-					"Type":        "int",
-					"Default":     30,
-					"Description": "全池最小活跃保底比例（%），默认 30%",
+					"Name":        "ewma_alpha",
+					"Type":        "float",
+					"Default":     defaultEWMAAlpha,
+					"Description": "EWMA 首字延迟平滑系数，默认 0.3",
 				},
 			},
 		},
@@ -284,23 +301,59 @@ func applyConfig(payload []byte) error {
 			return err
 		}
 	}
+	if cfg.ConsecutiveGatewayFailures <= 0 {
+		cfg.ConsecutiveGatewayFailures = defaultConsecutiveFailures
+	}
+	if cfg.BaseEjectionMinutes <= 0 {
+		cfg.BaseEjectionMinutes = defaultBaseEjectionMinutes
+	}
+	if cfg.MaxEjectionMinutes <= 0 {
+		cfg.MaxEjectionMinutes = defaultMaxEjectionMinutes
+	}
+	if cfg.PanicThresholdPercent <= 0 {
+		cfg.PanicThresholdPercent = defaultPanicThresholdPercent
+	}
+	if cfg.EWMAAlpha <= 0 || cfg.EWMAAlpha > 1 {
+		cfg.EWMAAlpha = defaultEWMAAlpha
+	}
 	currentConfig.Store(cfg)
 	return nil
 }
 
-// 调度核心：P2C (Power of Two Choices) + Peak-EWMA + Half-Open 金丝雀探活
-func handleSchedulerPick(payload []byte) ([]byte, error) {
-	var req pluginapi.SchedulerPickRequest
-	if err := json.Unmarshal(payload, &req); err != nil {
-		return errorEnvelope("invalid_request", err.Error()), nil
-	}
+// ==========================================
+// 子系统 1：P2C + Peak-EWMA 流量路由器 (Traffic Router)
+// 业界标准：Twitter Finagle / Linkerd
+// 纯数学连续代价优化，绝不因延迟而驱逐节点
+// ==========================================
 
-	if len(req.Candidates) == 0 {
+func calculatePeakEWMACost(acc *AccountHealth) float64 {
+	if acc == nil {
+		return 100000.0
+	}
+	base := acc.EWMATTFTMs
+	if base <= 0 {
+		base = 8000.0 // 默认初值 8s
+	}
+	// 在飞并发惩罚：Cost = EWMA_TTFT * (InFlight + 1)
+	multiplier := float64(acc.InFlight + 1)
+	if acc.Status == StatusCanary {
+		// 金丝雀试水账号给予 0.9 试探倾斜系数，优先捕获单笔试水流量
+		return base * 0.9 * multiplier
+	}
+	return base * multiplier
+}
+
+func handlePickAuth(payload []byte) ([]byte, error) {
+	cfg := currentConfig.Load().(Config)
+	if !cfg.Enabled {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 	}
 
-	cfg := currentConfig.Load().(Config)
-	if !cfg.Enabled {
+	var req pluginapi.SchedulerPickRequest
+	if err := json.Unmarshal(payload, &req); err != nil {
+		return errorEnvelope("invalid_payload", err.Error()), nil
+	}
+	if len(req.Candidates) == 0 {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 	}
 
@@ -311,14 +364,13 @@ func handleSchedulerPick(payload []byte) ([]byte, error) {
 	var eligibleCandidates []pluginapi.SchedulerAuthCandidate
 	var coolingCandidates []*AccountHealth
 
-	// 1. 状态流转与候选资格筛选
 	for _, cand := range req.Candidates {
-		acc, exists := globalState.accounts[cand.ID]
-		if !exists {
+		acc, ok := globalState.accounts[cand.ID]
+		if !ok {
 			acc = &AccountHealth{
 				AuthID:     cand.ID,
 				Status:     StatusHealthy,
-				EWMATTFTMs: 8000, // 初始预估 8s
+				EWMATTFTMs: 8000,
 				LastSeen:   now,
 			}
 			globalState.accounts[cand.ID] = acc
@@ -326,9 +378,9 @@ func handleSchedulerPick(payload []byte) ([]byte, error) {
 
 		if acc.Status == StatusCoolingDown {
 			if now.After(acc.DemotedUntil) {
-				// 静默期满：转入 Half-Open 金丝雀试水状态！
+				// 隔离期满：自动转移至 Half-Open 金丝雀试水态
 				acc.Status = StatusCanary
-				acc.DemotedReason = "冷却期满，进入金丝雀单笔试水状态"
+				acc.DemotedReason = "隔离期满，进入金丝雀单笔试水状态"
 			} else {
 				coolingCandidates = append(coolingCandidates, acc)
 				continue
@@ -336,21 +388,21 @@ func handleSchedulerPick(payload []byte) ([]byte, error) {
 		}
 
 		if acc.Status == StatusCanary {
-			// 金丝雀状态保护：只允许放行 1 笔请求试水！
+			// 半开状态严格保护：仅允许 1 笔试水在飞，不允许多并发冲刷
 			if acc.InFlight == 0 {
 				eligibleCandidates = append(eligibleCandidates, cand)
 			}
 			continue
 		}
 
-		// 正常健康账号
 		if acc.Status == StatusHealthy {
 			eligibleCandidates = append(eligibleCandidates, cand)
 		}
 	}
 
-	// 2. 动态保底容量防御：防止极度恶劣情况下号池被全部降空
-	minActive := int(math.Ceil(float64(len(req.Candidates)) * float64(cfg.MinActiveRatioPercent) / 100.0))
+	// Envoy Panic Threshold (恐慌保底门限)
+	// 当可用健康节点比例低于 panic_threshold_percent 时，激活 Panic 模式借调隔离中节点，保证服务永不断流
+	minActive := int(math.Ceil(float64(len(req.Candidates)) * float64(cfg.PanicThresholdPercent) / 100.0))
 	if minActive < defaultMinActive {
 		minActive = defaultMinActive
 	}
@@ -359,7 +411,7 @@ func handleSchedulerPick(payload []byte) ([]byte, error) {
 	}
 
 	if len(eligibleCandidates) < minActive && len(coolingCandidates) > 0 {
-		// 按冷却截止时间升序排序（最快将要恢复的排前）
+		// 按最快解禁时间升序排序（最接近恢复的优先借调）
 		sort.Slice(coolingCandidates, func(i, j int) bool {
 			return coolingCandidates[i].DemotedUntil.Before(coolingCandidates[j].DemotedUntil)
 		})
@@ -380,13 +432,11 @@ func handleSchedulerPick(payload []byte) ([]byte, error) {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 	}
 
-	// 3. P2C (Power of Two Choices) 路由决策算法
-	// 从候选池中随机抽取 2 个账号，计算 Score = EWMA_TTFT * (InFlight + 1)，选择代价更小的账号
+	// P2C (Power of Two Choices) 随机二选一比较代价
 	var selectedID string
 	if len(eligibleCandidates) == 1 {
 		selectedID = eligibleCandidates[0].ID
 	} else {
-		// 随机挑选两个不同候选者
 		i := globalState.rng.Intn(len(eligibleCandidates))
 		j := globalState.rng.Intn(len(eligibleCandidates) - 1)
 		if j >= i {
@@ -408,7 +458,7 @@ func handleSchedulerPick(payload []byte) ([]byte, error) {
 		}
 	}
 
-	// 记录在飞并发数递增
+	// 原子标记在飞并发数递增
 	if acc, ok := globalState.accounts[selectedID]; ok {
 		acc.InFlight++
 		acc.LastSeen = now
@@ -420,22 +470,11 @@ func handleSchedulerPick(payload []byte) ([]byte, error) {
 	})
 }
 
-// P2C 成本计算公式：Cost = EWMA_TTFT * (InFlight + 1)
-func calculatePeakEWMACost(acc *AccountHealth) float64 {
-	if acc == nil {
-		return 100000.0
-	}
-	base := acc.EWMATTFTMs
-	if base <= 0 {
-		base = 8000.0 // 默认 8s
-	}
-	// 金丝雀试水账号稍微增加一点探测优先级，便于早点完成试水
-	multiplier := float64(acc.InFlight + 1)
-	if acc.Status == StatusCanary {
-		return base * 0.9 * multiplier
-	}
-	return base * multiplier
-}
+// ==========================================
+// 子系统 2：异常点检测与熔断器 (Outlier Detection & Circuit Breaker)
+// 业界标准：Envoy Outlier Detection & Martin Fowler Circuit Breaker
+// 严格基于离散故障信号（429、连续5xx/断连）熔断，延迟指标纯交由 P2C 降权
+// ==========================================
 
 // 动态解析 Google 上游返回的 RetryInfo 中的 retryDelay（如 "23s"）
 func parseGoogleRetryDelay(body string) time.Duration {
@@ -459,10 +498,9 @@ func parseGoogleRetryDelay(body string) time.Duration {
 			}
 		}
 	}
-	return 30 * time.Second // 兜底 30 秒
+	return 30 * time.Second // 默认 30s 兜底
 }
 
-// 请求流式结束/失败回调：更新 TTFT、InFlight、熔断判定
 func handleUsage(payload []byte) ([]byte, error) {
 	var rec pluginapi.UsageRecord
 	if err := json.Unmarshal(payload, &rec); err != nil {
@@ -474,7 +512,7 @@ func handleUsage(payload []byte) ([]byte, error) {
 		return okEnvelope(map[string]any{})
 	}
 
-	// 核心过滤：彻底排除 404 NOT_FOUND（未授权模型号池遍历绝不计入故障）
+	// 豁免规则 1：彻底排除 404 NOT_FOUND（未授权模型号池遍历，属于常规路由探测，绝不计入故障）
 	if rec.Failure.StatusCode == 404 {
 		globalState.mu.Lock()
 		if acc, ok := globalState.accounts[authID]; ok {
@@ -515,67 +553,83 @@ func handleUsage(payload []byte) ([]byte, error) {
 		acc.Flap = 0
 	}
 
-	// 核心过滤 2：排除 503 MODEL_CAPACITY_EXHAUSTED（Google 服务器机房集群算力瞬时满载，非账号故障）
+	// 豁免规则 2：排除 503 MODEL_CAPACITY_EXHAUSTED（Google 服务器机房集群算力瞬时满载，非账号故障）
 	if rec.Failure.StatusCode == 503 && (strings.Contains(rec.Failure.Body, "MODEL_CAPACITY_EXHAUSTED") || strings.Contains(rec.Failure.Body, "No capacity")) {
-		// 动态解析 Google 官方指示的精准冷却时长 (如 "23s")
 		delay := parseGoogleRetryDelay(rec.Failure.Body)
 		acc.DemotedUntil = now.Add(delay)
-		acc.DemotedReason = fmt.Sprintf("Google上游集群算力瞬时满载(503 MODEL_CAPACITY_EXHAUSTED)，动态避让%s", delay.Round(time.Second))
+		acc.DemotedReason = fmt.Sprintf("Google机房集群算力瞬时满载(503 MODEL_CAPACITY_EXHAUSTED)，精准避让%s", delay.Round(time.Second))
 		return okEnvelope(map[string]any{})
 	}
 
-	ttftMs := rec.TTFT.Milliseconds()
-	acc.LastTTFTMs = ttftMs
+	// ----------------------------------------------------
+	// 熔断与恢复检验：纯粹基于二元成功/失败状态，无任何主观延迟阈值
+	// ----------------------------------------------------
 
-	// 判定恶性故障：单笔极端慢(>=90s) 或 真429额度耗尽 或 严重超时断连(>=90s)
-	isHardSingle := ttftMs >= int64(cfg.HardMaxMs)
-	isSevereFail := rec.Failed && (rec.Failure.StatusCode == 429 || rec.Latency >= time.Duration(cfg.HardMaxMs)*time.Millisecond)
-
-	// 【Half-Open 金丝雀状态专属检验】
+	// 【Half-Open 金丝雀状态检验】
 	if acc.Status == StatusCanary {
-		if !rec.Failed && ttftMs > 0 && ttftMs < int64(cfg.SlowAvgMs) {
-			// 金丝雀单笔试水成功！首字 < 25s 且无报错，证明 Google 慢队列已彻底退散，满血转正！
+		if !rec.Failed {
+			// 试水成功！收到正常响应，证明上游封禁已彻底解除，立刻转正！
 			acc.Status = StatusHealthy
 			acc.RestoredAt = now
+			acc.ConsecutiveFail = 0
 			acc.DemotedUntil = time.Time{}
 			acc.DemotedReason = ""
-			acc.EWMATTFTMs = float64(ttftMs)
+			ttftMs := rec.TTFT.Milliseconds()
+			if ttftMs > 0 {
+				acc.LastTTFTMs = ttftMs
+				acc.EWMATTFTMs = float64(ttftMs)
+			}
 		} else {
-			// 金丝雀试水失败或依然慢：重度退避翻倍至 10 小时 (600 分钟)！
+			// 试水失败！明确报错，重度惩罚升级（指数退避）
 			acc.TotalFails++
 			acc.Flap++
 			acc.Status = StatusCoolingDown
-			acc.DemotedUntil = now.Add(time.Duration(cfg.CanaryFailMinutes) * time.Minute)
-			acc.DemotedReason = fmt.Sprintf("金丝雀试水未通过(首字 %dms, 失败=%v)，惩罚升级10h", ttftMs, rec.Failed)
+			ejectMinutes := cfg.MaxEjectionMinutes
+			acc.DemotedUntil = now.Add(time.Duration(ejectMinutes) * time.Minute)
+			acc.DemotedReason = fmt.Sprintf("金丝雀试水未通过(状态码 %d)，惩罚升级%dm", rec.Failure.StatusCode, ejectMinutes)
 		}
 		return okEnvelope(map[string]any{})
 	}
 
-	// 【正常在岗账号的恶性故障熔断】
-	if isHardSingle || isSevereFail {
-		acc.TotalFails++
-		acc.Flap++
-		acc.Status = StatusCoolingDown
-		acc.DemotedUntil = now.Add(time.Duration(cfg.CooldownMinutes) * time.Minute)
-		if isHardSingle {
-			acc.DemotedReason = fmt.Sprintf("单笔极端慢首字 %dms(>=%dms)，触发5h熔断", ttftMs, cfg.HardMaxMs)
-		} else {
-			acc.DemotedReason = fmt.Sprintf("真429/严重超时(状态码 %d)，触发5h熔断", rec.Failure.StatusCode)
-		}
-		return okEnvelope(map[string]any{})
-	}
-
+	// 【正常在岗账号的故障判定】
 	if rec.Failed {
 		acc.TotalFails++
+
+		// 判定一：429 配额耗竭（强隔离）
+		if rec.Failure.StatusCode == 429 || strings.Contains(rec.Failure.Body, "RESOURCE_EXHAUSTED") {
+			acc.Flap++
+			acc.ConsecutiveFail = 0
+			acc.Status = StatusCoolingDown
+			acc.DemotedUntil = now.Add(time.Duration(cfg.BaseEjectionMinutes) * time.Minute)
+			acc.DemotedReason = "上游429配额耗尽(RESOURCE_EXHAUSTED)，熔断隔离5h"
+			return okEnvelope(map[string]any{})
+		}
+
+		// 判定二：Envoy 连续网关故障检测（5xx / 网络超时 / 连接中断）
+		acc.ConsecutiveFail++
+		if acc.ConsecutiveFail >= cfg.ConsecutiveGatewayFailures {
+			acc.Flap++
+			acc.Status = StatusCoolingDown
+			acc.DemotedUntil = now.Add(time.Duration(cfg.BaseEjectionMinutes) * time.Minute)
+			acc.DemotedReason = fmt.Sprintf("连续 %d 次上游网关故障(状态码 %d)，触发隔离5h", acc.ConsecutiveFail, rec.Failure.StatusCode)
+			acc.ConsecutiveFail = 0
+			return okEnvelope(map[string]any{})
+		}
 		return okEnvelope(map[string]any{})
 	}
 
-	// 【正常在岗账号的平滑首字更新】：只更新 EWMA 供 P2C 算法动态降权，绝不关冷宫！
+	// ----------------------------------------------------
+	// 成功请求处理：重置连续故障计数，平滑更新 EWMA 延迟
+	// ----------------------------------------------------
+	acc.ConsecutiveFail = 0
+	ttftMs := rec.TTFT.Milliseconds()
 	if ttftMs > 0 {
+		acc.LastTTFTMs = ttftMs
 		if acc.EWMATTFTMs <= 0 {
 			acc.EWMATTFTMs = float64(ttftMs)
 		} else {
-			acc.EWMATTFTMs = ewmaAlpha*float64(ttftMs) + (1-ewmaAlpha)*acc.EWMATTFTMs
+			alpha := cfg.EWMAAlpha
+			acc.EWMATTFTMs = alpha*float64(ttftMs) + (1.0-alpha)*acc.EWMATTFTMs
 		}
 	}
 
@@ -595,69 +649,87 @@ func handleManagementRegister() ([]byte, error) {
 	return okEnvelope(routes)
 }
 
-// 管理端点：实时查看内存中每个账号的健康状态、在飞并发、EWMA延迟
-func handleManagementHandle(payload []byte) ([]byte, error) {
+func handleManagementHTTP(payload []byte) ([]byte, error) {
+	var req struct {
+		Method string `json:"method"`
+		Path   string `json:"path"`
+	}
+	if err := json.Unmarshal(payload, &req); err != nil {
+		return errorEnvelope("invalid_payload", err.Error()), nil
+	}
+
+	if req.Method == "GET" && strings.HasSuffix(req.Path, "/status") {
+		return handleManagementStatus()
+	}
+
+	return okEnvelope(map[string]any{
+		"status_code": http.StatusNotFound,
+		"headers": map[string]string{
+			"Content-Type": "application/json",
+		},
+		"body": `{"error": "route_not_found"}`,
+	})
+}
+
+func handleManagementStatus() ([]byte, error) {
+	cfg := currentConfig.Load().(Config)
 	now := time.Now()
+
 	globalState.mu.RLock()
 	defer globalState.mu.RUnlock()
 
-	list := make([]AccountHealth, 0, len(globalState.accounts))
+	var list []*AccountHealth
+	healthyCount := 0
+	coolingCount := 0
+	canaryCount := 0
+
 	for _, acc := range globalState.accounts {
-		item := *acc
-		if item.Status == StatusCoolingDown {
-			if now.Before(item.DemotedUntil) {
-				item.CooldownMinutes = math.Round(item.DemotedUntil.Sub(now).Minutes()*10) / 10
+		clone := *acc
+		if clone.Status == StatusCoolingDown && !clone.DemotedUntil.IsZero() {
+			rem := clone.DemotedUntil.Sub(now).Minutes()
+			if rem > 0 {
+				clone.CooldownMinutes = math.Round(rem*10) / 10
 			} else {
-				item.Status = StatusCanary
-				item.CooldownMinutes = 0
+				clone.CooldownMinutes = 0
 			}
 		}
-		item.AvgTTFTMs = int64(math.Round(item.EWMATTFTMs))
-		list = append(list, item)
+		list = append(list, &clone)
+
+		switch clone.Status {
+		case StatusHealthy:
+			healthyCount++
+		case StatusCoolingDown:
+			coolingCount++
+		case StatusCanary:
+			canaryCount++
+		}
 	}
 
 	sort.Slice(list, func(i, j int) bool {
-		return list[i].AvgTTFTMs < list[j].AvgTTFTMs
-	})
-
-	data, _ := json.Marshal(map[string]any{
-		"time":     now.Format(time.RFC3339),
-		"accounts": list,
+		return list[i].EWMATTFTMs < list[j].EWMATTFTMs
 	})
 
 	resp := map[string]any{
+		"plugin":  pluginName,
+		"version": pluginVersion,
+		"config":  cfg,
+		"summary": map[string]any{
+			"total_accounts":   len(list),
+			"healthy_accounts": healthyCount,
+			"cooling_accounts": coolingCount,
+			"canary_accounts":  canaryCount,
+		},
+		"accounts": list,
+	}
+
+	b, _ := json.Marshal(resp)
+	return okEnvelope(map[string]any{
 		"status_code": http.StatusOK,
 		"headers": map[string]string{
 			"Content-Type": "application/json",
 		},
-		"body": string(data),
-	}
-	return okEnvelope(resp)
-}
-
-func okEnvelope(result any) ([]byte, error) {
-	raw, err := json.Marshal(result)
-	if err != nil {
-		return nil, err
-	}
-	return json.Marshal(envelope{OK: true, Result: json.RawMessage(raw)})
-}
-
-func errorEnvelope(code, message string) []byte {
-	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{Code: code, Message: message}})
-	return raw
-}
-
-func writeResponse(response *C.cliproxy_buffer, raw []byte) {
-	if response == nil || len(raw) == 0 {
-		return
-	}
-	ptr := C.CBytes(raw)
-	if ptr == nil {
-		return
-	}
-	response.ptr = ptr
-	response.len = C.size_t(len(raw))
+		"body": string(b),
+	})
 }
 
 func main() {}
