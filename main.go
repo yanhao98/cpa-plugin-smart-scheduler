@@ -51,13 +51,13 @@ import (
 
 const (
 	pluginName                    = "cpa-plugin-smart-scheduler"
-	pluginVersion                 = "0.4.1"
-	defaultConsecutiveFailures    = 3      // Envoy standard consecutive gateway failures
-	defaultBaseEjectionMinutes    = 300    // 300m (5 hours), Google Gemini quota window
-	defaultMaxEjectionMinutes     = 600    // 600m (10 hours), maximum backoff cap
-	defaultPanicThresholdPercent  = 30     // Envoy healthy_panic_threshold (minimum 30% active accounts)
-	defaultMinActive              = 3      // Minimum active accounts floor
-	defaultEWMAAlpha              = 0.3    // Exponential smoothing factor for TTFT
+	pluginVersion                 = "0.5.0"
+	defaultConsecutiveFailures    = 3   // Envoy standard consecutive gateway failures
+	defaultBaseEjectionMinutes    = 300 // 300m (5 hours), Google Gemini quota window
+	defaultMaxEjectionMinutes     = 600 // 600m (10 hours), maximum backoff cap
+	defaultPanicThresholdPercent  = 30  // Envoy healthy_panic_threshold (minimum 30% active accounts)
+	defaultMinActive              = 3   // Minimum active accounts floor
+	defaultEWMAAlpha              = 0.3 // Exponential smoothing factor for TTFT
 )
 
 type AccountStatus string
@@ -92,21 +92,28 @@ func defaultConfig() Config {
 
 var currentConfig atomic.Value
 
+// 单个模型在特定账号上的延迟统计（按模型严格隔离，避免思考大模型污染轻量模型）
+type ModelMetrics struct {
+	EWMATTFTMs    float64   `json:"ewma_ttft_ms"`
+	LastTTFTMs    int64     `json:"last_ttft_ms"`
+	TotalRequests int64     `json:"total_requests"`
+	LastSeen      time.Time `json:"last_seen"`
+}
+
 type AccountHealth struct {
-	AuthID          string        `json:"auth_id"`
-	Status          AccountStatus `json:"status"` // "healthy", "cooling_down", "canary"
-	InFlight        int64         `json:"in_flight"`
-	EWMATTFTMs      float64       `json:"ewma_ttft_ms"`
-	LastTTFTMs      int64         `json:"last_ttft_ms"`
-	TotalRequests   int64         `json:"total_requests"`
-	TotalFails      int64         `json:"total_fails"`
-	ConsecutiveFail int           `json:"consecutive_fails"`
-	DemotedUntil    time.Time     `json:"demoted_until,omitempty"`
-	DemotedReason   string        `json:"demoted_reason,omitempty"`
-	Flap            int           `json:"flap"`
-	LastSeen        time.Time     `json:"last_seen"`
-	RestoredAt      time.Time     `json:"restored_at,omitempty"`
-	CooldownMinutes float64       `json:"cooldown_remaining_minutes,omitempty"`
+	AuthID          string                  `json:"auth_id"`
+	Status          AccountStatus           `json:"status"` // "healthy", "cooling_down", "canary"
+	InFlight        int64                   `json:"in_flight"`
+	TotalRequests   int64                   `json:"total_requests"`
+	TotalFails      int64                   `json:"total_fails"`
+	ConsecutiveFail int                     `json:"consecutive_fails"`
+	DemotedUntil    time.Time               `json:"demoted_until,omitempty"`
+	DemotedReason   string                  `json:"demoted_reason,omitempty"`
+	Flap            int                     `json:"flap"`
+	LastSeen        time.Time               `json:"last_seen"`
+	RestoredAt      time.Time               `json:"restored_at,omitempty"`
+	CooldownMinutes float64                 `json:"cooldown_remaining_minutes,omitempty"`
+	Models          map[string]*ModelMetrics `json:"models"` // 按模型独立追踪
 }
 
 type SchedulerState struct {
@@ -239,7 +246,7 @@ func handleRegister(payload []byte) ([]byte, error) {
 			"Version":          pluginVersion,
 			"Author":           "yanhao98",
 			"GitHubRepository": "https://github.com/yanhao98/cpa-plugin-smart-scheduler",
-			"Description":      "Decoupled P2C + Peak-EWMA Traffic Router & Envoy-Standard Outlier Detection Circuit Breaker",
+			"Description":      "Per-Model P2C + Peak-EWMA Traffic Router & Envoy-Standard Outlier Detection Circuit Breaker",
 			"ConfigFields": []map[string]any{
 				{
 					"Name":        "consecutive_gateway_failures",
@@ -319,27 +326,72 @@ func applyConfig(payload []byte) error {
 	return nil
 }
 
+// 规范化模型名（小写且去除空格，确保思考模型别名与主模型严格区分）
+func canonicalModel(model string) string {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if m == "" {
+		return "default"
+	}
+	return m
+}
+
+// 计算全池健康账号在指定模型上的动态集群均值（Fleet Mean），作为新号无偏初始化的依据
+func getFleetMeanEWMA(model string) (float64, bool) {
+	var sum float64
+	var count int
+	for _, acc := range globalState.accounts {
+		if acc.Status != StatusHealthy || acc.Models == nil {
+			continue
+		}
+		if m, ok := acc.Models[model]; ok && m.TotalRequests > 0 && m.EWMATTFTMs > 0 {
+			sum += m.EWMATTFTMs
+			count++
+		}
+	}
+	if count > 0 {
+		return sum / float64(count), true
+	}
+	return 0, false
+}
+
 // ==========================================
-// 子系统 1：P2C + Peak-EWMA 流量路由器 (Traffic Router)
+// 子系统 1：按模型隔离的 P2C + Peak-EWMA 流量路由器 (Traffic Router)
 // 业界标准：Twitter Finagle / Linkerd
-// 纯数学连续代价优化，绝不因延迟而驱逐节点
+// 彻底去除固定常数，采用动态集群均值与零偏置冷启动
 // ==========================================
 
-func calculatePeakEWMACost(acc *AccountHealth) float64 {
+func calculateModelCost(acc *AccountHealth, model string) float64 {
 	if acc == nil {
-		return 100000.0
+		return 1e9
 	}
-	base := acc.EWMATTFTMs
+
+	var base float64
+	if acc.Models != nil {
+		if m, ok := acc.Models[model]; ok && m.TotalRequests > 0 && m.EWMATTFTMs > 0 {
+			base = m.EWMATTFTMs
+		}
+	}
+
+	// 冷启动无样本状态：严禁写死任何固定数字，动态继承集群当前模型的真实工况
 	if base <= 0 {
-		base = 8000.0 // 默认初值 8s
+		fleetMean, hasFleet := getFleetMeanEWMA(model)
+		if hasFleet {
+			// 探索偏置：赋予 0.8 系数，促使新号在安全边界内尽早采得第一笔真实样本，同时绝不引起羊群冲击
+			base = fleetMean * 0.8
+		} else {
+			// 全池首次冷启动：所有账号处于完全相同的中性基准
+			// Cost 纯粹取决于 (InFlight + 1)，退化为均匀随机 / 最小连接数均衡探索
+			base = 1000.0
+		}
 	}
-	// 在飞并发惩罚：Cost = EWMA_TTFT * (InFlight + 1)
-	multiplier := float64(acc.InFlight + 1)
+
 	if acc.Status == StatusCanary {
-		// 金丝雀试水账号给予 0.9 试探倾斜系数，优先捕获单笔试水流量
-		return base * 0.9 * multiplier
+		// 金丝雀试水账号给予 0.8 优先试探系数，优先捕获单笔试水流量完成检验
+		base *= 0.8
 	}
-	return base * multiplier
+
+	// 在飞并发惩罚：Cost = BaseCost * (InFlight + 1)
+	return base * float64(acc.InFlight + 1)
 }
 
 func handlePickAuth(payload []byte) ([]byte, error) {
@@ -356,6 +408,7 @@ func handlePickAuth(payload []byte) ([]byte, error) {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 	}
 
+	modelKey := canonicalModel(req.Model)
 	now := time.Now()
 	globalState.mu.Lock()
 	defer globalState.mu.Unlock()
@@ -364,19 +417,20 @@ func handlePickAuth(payload []byte) ([]byte, error) {
 	var coolingCandidates []*AccountHealth
 
 	for _, cand := range req.Candidates {
-		// 防御：跳过缺失 AuthID 的异常候选，避免把空 ID 返回给宿主
 		if strings.TrimSpace(cand.ID) == "" {
 			continue
 		}
 		acc, ok := globalState.accounts[cand.ID]
 		if !ok {
 			acc = &AccountHealth{
-				AuthID:     cand.ID,
-				Status:     StatusHealthy,
-				EWMATTFTMs: 8000,
-				LastSeen:   now,
+				AuthID:   cand.ID,
+				Status:   StatusHealthy,
+				LastSeen: now,
+				Models:   make(map[string]*ModelMetrics),
 			}
 			globalState.accounts[cand.ID] = acc
+		} else if acc.Models == nil {
+			acc.Models = make(map[string]*ModelMetrics)
 		}
 
 		if acc.Status == StatusCoolingDown {
@@ -414,7 +468,6 @@ func handlePickAuth(payload []byte) ([]byte, error) {
 	}
 
 	if len(eligibleCandidates) < minActive && len(coolingCandidates) > 0 {
-		// 按最快解禁时间升序排序（最接近恢复的优先借调）
 		sort.Slice(coolingCandidates, func(i, j int) bool {
 			return coolingCandidates[i].DemotedUntil.Before(coolingCandidates[j].DemotedUntil)
 		})
@@ -435,7 +488,7 @@ func handlePickAuth(payload []byte) ([]byte, error) {
 		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
 	}
 
-	// P2C (Power of Two Choices) 随机二选一比较代价
+	// P2C (Power of Two Choices) 随机二选一比较在指定模型上的实时综合代价
 	var selectedID string
 	if len(eligibleCandidates) == 1 {
 		selectedID = eligibleCandidates[0].ID
@@ -451,8 +504,8 @@ func handlePickAuth(payload []byte) ([]byte, error) {
 		accA := globalState.accounts[candA.ID]
 		accB := globalState.accounts[candB.ID]
 
-		costA := calculatePeakEWMACost(accA)
-		costB := calculatePeakEWMACost(accB)
+		costA := calculateModelCost(accA, modelKey)
+		costB := calculateModelCost(accB, modelKey)
 
 		if costA <= costB {
 			selectedID = candA.ID
@@ -541,6 +594,7 @@ func handleUsage(payload []byte) ([]byte, error) {
 		return okEnvelope(map[string]any{})
 	}
 
+	modelKey := canonicalModel(rec.Model)
 	cfg := currentConfig.Load().(Config)
 	now := time.Now()
 
@@ -550,12 +604,14 @@ func handleUsage(payload []byte) ([]byte, error) {
 	acc, exists := globalState.accounts[authID]
 	if !exists {
 		acc = &AccountHealth{
-			AuthID:     authID,
-			Status:     StatusHealthy,
-			EWMATTFTMs: 8000,
-			LastSeen:   now,
+			AuthID:   authID,
+			Status:   StatusHealthy,
+			LastSeen: now,
+			Models:   make(map[string]*ModelMetrics),
 		}
 		globalState.accounts[authID] = acc
+	} else if acc.Models == nil {
+		acc.Models = make(map[string]*ModelMetrics)
 	}
 
 	// 在飞并发计数归还
@@ -591,11 +647,6 @@ func handleUsage(payload []byte) ([]byte, error) {
 			acc.ConsecutiveFail = 0
 			acc.DemotedUntil = time.Time{}
 			acc.DemotedReason = ""
-			ttftMs := rec.TTFT.Milliseconds()
-			if ttftMs > 0 {
-				acc.LastTTFTMs = ttftMs
-				acc.EWMATTFTMs = float64(ttftMs)
-			}
 		} else {
 			// 试水失败！明确报错，重度惩罚升级（指数退避）
 			acc.TotalFails++
@@ -636,18 +687,27 @@ func handleUsage(payload []byte) ([]byte, error) {
 	}
 
 	// ----------------------------------------------------
-	// 成功请求处理：重置连续故障计数，平滑更新 EWMA 延迟
+	// 成功请求处理：重置连续故障计数，按模型独立更新平滑延迟
 	// ----------------------------------------------------
 	acc.ConsecutiveFail = 0
 	ttftMs := rec.TTFT.Milliseconds()
 	if ttftMs > 0 {
-		acc.LastTTFTMs = ttftMs
-		if acc.EWMATTFTMs <= 0 {
-			acc.EWMATTFTMs = float64(ttftMs)
+		m, ok := acc.Models[modelKey]
+		if !ok {
+			m = &ModelMetrics{}
+			acc.Models[modelKey] = m
+		}
+		m.LastTTFTMs = ttftMs
+		m.LastSeen = now
+
+		if m.TotalRequests == 0 || m.EWMATTFTMs <= 0 {
+			// 首包 100% 直接替换（First-Sample Replacement），严禁与伪种子掺水
+			m.EWMATTFTMs = float64(ttftMs)
 		} else {
 			alpha := cfg.EWMAAlpha
-			acc.EWMATTFTMs = alpha*float64(ttftMs) + (1.0-alpha)*acc.EWMATTFTMs
+			m.EWMATTFTMs = alpha*float64(ttftMs) + (1.0-alpha)*m.EWMATTFTMs
 		}
+		m.TotalRequests++
 	}
 
 	return okEnvelope(map[string]any{})
@@ -679,12 +739,12 @@ func handleManagementHTTP(payload []byte) ([]byte, error) {
 		return handleManagementStatus()
 	}
 
-	return okEnvelope(map[string]any{
-		"status_code": http.StatusNotFound,
-		"headers": map[string]string{
-			"Content-Type": "application/json",
+	return okEnvelope(pluginapi.ManagementResponse{
+		StatusCode: http.StatusNotFound,
+		Headers: http.Header{
+			"Content-Type": []string{"application/json"},
 		},
-		"body": `{"error": "route_not_found"}`,
+		Body: []byte(`{"error": "route_not_found"}`),
 	})
 }
 
@@ -702,6 +762,14 @@ func handleManagementStatus() ([]byte, error) {
 
 	for _, acc := range globalState.accounts {
 		clone := *acc
+		// 深拷贝 models map
+		if acc.Models != nil {
+			clone.Models = make(map[string]*ModelMetrics, len(acc.Models))
+			for k, v := range acc.Models {
+				mClone := *v
+				clone.Models[k] = &mClone
+			}
+		}
 		if clone.Status == StatusCoolingDown && !clone.DemotedUntil.IsZero() {
 			rem := clone.DemotedUntil.Sub(now).Minutes()
 			if rem > 0 {
@@ -723,8 +791,23 @@ func handleManagementStatus() ([]byte, error) {
 	}
 
 	sort.Slice(list, func(i, j int) bool {
-		return list[i].EWMATTFTMs < list[j].EWMATTFTMs
+		return list[i].AuthID < list[j].AuthID
 	})
+
+	// 汇总各模型的全池均值
+	fleetMeans := make(map[string]float64)
+	for _, acc := range globalState.accounts {
+		if acc.Status != StatusHealthy || acc.Models == nil {
+			continue
+		}
+		for mName := range acc.Models {
+			if _, exists := fleetMeans[mName]; !exists {
+				if mean, ok := getFleetMeanEWMA(mName); ok {
+					fleetMeans[mName] = math.Round(mean*10) / 10
+				}
+			}
+		}
+	}
 
 	resp := map[string]any{
 		"plugin":  pluginName,
@@ -735,17 +818,18 @@ func handleManagementStatus() ([]byte, error) {
 			"healthy_accounts": healthyCount,
 			"cooling_accounts": coolingCount,
 			"canary_accounts":  canaryCount,
+			"fleet_mean_ttft":  fleetMeans,
 		},
 		"accounts": list,
 	}
 
 	b, _ := json.Marshal(resp)
-	return okEnvelope(map[string]any{
-		"status_code": http.StatusOK,
-		"headers": map[string]string{
-			"Content-Type": "application/json",
+	return okEnvelope(pluginapi.ManagementResponse{
+		StatusCode: http.StatusOK,
+		Headers: http.Header{
+			"Content-Type": []string{"application/json"},
 		},
-		"body": string(b),
+		Body: b,
 	})
 }
 
