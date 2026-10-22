@@ -51,7 +51,7 @@ import (
 
 const (
 	pluginName                    = "cpa-plugin-smart-scheduler"
-	pluginVersion                 = "0.4.0"
+	pluginVersion                 = "0.4.1"
 	defaultConsecutiveFailures    = 3      // Envoy standard consecutive gateway failures
 	defaultBaseEjectionMinutes    = 300    // 300m (5 hours), Google Gemini quota window
 	defaultMaxEjectionMinutes     = 600    // 600m (10 hours), maximum backoff cap
@@ -364,6 +364,10 @@ func handlePickAuth(payload []byte) ([]byte, error) {
 	var coolingCandidates []*AccountHealth
 
 	for _, cand := range req.Candidates {
+		// 防御：跳过缺失 AuthID 的异常候选，避免把空 ID 返回给宿主
+		if strings.TrimSpace(cand.ID) == "" {
+			continue
+		}
 		acc, ok := globalState.accounts[cand.ID]
 		if !ok {
 			acc = &AccountHealth{
@@ -457,6 +461,11 @@ func handlePickAuth(payload []byte) ([]byte, error) {
 		}
 	}
 
+	// 防御：确保选出的 AuthID 确实属于本次候选集
+	if strings.TrimSpace(selectedID) == "" || !containsCandidate(req.Candidates, selectedID) {
+		return okEnvelope(pluginapi.SchedulerPickResponse{Handled: false})
+	}
+
 	// 原子标记在飞并发数递增
 	if acc, ok := globalState.accounts[selectedID]; ok {
 		acc.InFlight++
@@ -467,6 +476,15 @@ func handlePickAuth(payload []byte) ([]byte, error) {
 		AuthID:  selectedID,
 		Handled: true,
 	})
+}
+
+func containsCandidate(cands []pluginapi.SchedulerAuthCandidate, id string) bool {
+	for _, c := range cands {
+		if c.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // ==========================================
