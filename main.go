@@ -38,6 +38,7 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -51,7 +52,8 @@ import (
 
 const (
 	pluginName                    = "cpa-plugin-smart-scheduler"
-	pluginVersion                 = "0.5.1"
+	pluginVersion                 = "0.5.2"
+	stateFilePath                 = "plugins/.smart_scheduler_state.json"
 	defaultConsecutiveFailures    = 3   // Envoy standard consecutive gateway failures
 	defaultBaseEjectionMinutes    = 300 // 300m (5 hours), Google Gemini quota window
 	defaultMaxEjectionMinutes     = 600 // 600m (10 hours), maximum backoff cap
@@ -120,11 +122,85 @@ type SchedulerState struct {
 	mu       sync.RWMutex
 	accounts map[string]*AccountHealth
 	rng      *rand.Rand
+	dirty    atomic.Bool
+}
+
+type PersistentState struct {
+	Accounts map[string]*AccountHealth `json:"accounts"`
+	SavedAt  time.Time                 `json:"saved_at"`
 }
 
 var globalState = &SchedulerState{
 	accounts: make(map[string]*AccountHealth),
 	rng:      rand.New(rand.NewSource(time.Now().UnixNano())),
+}
+
+func (s *SchedulerState) saveToFileLocked() {
+	if len(s.accounts) == 0 {
+		return
+	}
+	data, err := json.MarshalIndent(PersistentState{
+		Accounts: s.accounts,
+		SavedAt:  time.Now(),
+	}, "", "  ")
+	if err != nil {
+		return
+	}
+	tmpPath := stateFilePath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return
+	}
+	_ = os.Rename(tmpPath, stateFilePath)
+	s.dirty.Store(false)
+}
+
+func (s *SchedulerState) loadFromFile() {
+	data, err := os.ReadFile(stateFilePath)
+	if err != nil {
+		return
+	}
+	var ps PersistentState
+	if err := json.Unmarshal(data, &ps); err != nil || len(ps.Accounts) == 0 {
+		return
+	}
+	now := time.Now()
+	for id, acc := range ps.Accounts {
+		acc.InFlight = 0 // 重启后历史在飞并发必须归零
+		if acc.Models == nil {
+			acc.Models = make(map[string]*ModelMetrics)
+		}
+		// 状态校准：核算 5 小时熔断倒计时是否已经坐满
+		if acc.Status == StatusCoolingDown {
+			if !acc.DemotedUntil.IsZero() && now.After(acc.DemotedUntil) {
+				acc.Status = StatusCanary
+				acc.DemotedReason = "重启恢复核准：5h隔离期已满，自动转入金丝雀单笔试水状态"
+			}
+		}
+		s.accounts[id] = acc
+	}
+}
+
+var loadOnce sync.Once
+
+func ensureStateLoaded() {
+	loadOnce.Do(func() {
+		globalState.mu.Lock()
+		globalState.loadFromFile()
+		globalState.mu.Unlock()
+
+		// 启动低频异步刷盘协程（每 5 秒若有变更则原子落盘一次）
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				if globalState.dirty.Load() {
+					globalState.mu.Lock()
+					globalState.saveToFileLocked()
+					globalState.mu.Unlock()
+				}
+			}
+		}()
+	})
 }
 
 type envelope struct {
@@ -151,6 +227,7 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 	if plugin == nil {
 		return 1
 	}
+	ensureStateLoaded()
 	plugin.abi_version = 1
 	plugin.call = (C.cliproxy_plugin_call_fn)(C.cliproxyPluginCall)
 	plugin.free_buffer = (C.cliproxy_plugin_free_fn)(C.cliproxyPluginFree)
@@ -195,7 +272,11 @@ func cliproxyPluginFree(ptr unsafe.Pointer, size C.size_t) {
 }
 
 //export cliproxyPluginShutdown
-func cliproxyPluginShutdown() {}
+func cliproxyPluginShutdown() {
+	globalState.mu.Lock()
+	globalState.saveToFileLocked()
+	globalState.mu.Unlock()
+}
 
 func dispatch(op string, payload []byte) ([]byte, error) {
 	switch op {
@@ -669,6 +750,7 @@ func handleUsage(payload []byte) ([]byte, error) {
 			acc.DemotedUntil = now.Add(time.Duration(ejectMinutes) * time.Minute)
 			acc.DemotedReason = fmt.Sprintf("金丝雀试水未通过(状态码 %d)，惩罚升级%dm", rec.Failure.StatusCode, ejectMinutes)
 		}
+		globalState.saveToFileLocked()
 		return okEnvelope(map[string]any{})
 	}
 
@@ -683,6 +765,7 @@ func handleUsage(payload []byte) ([]byte, error) {
 			acc.Status = StatusCoolingDown
 			acc.DemotedUntil = now.Add(time.Duration(cfg.BaseEjectionMinutes) * time.Minute)
 			acc.DemotedReason = "上游429配额耗尽(RESOURCE_EXHAUSTED)，熔断隔离5h"
+			globalState.saveToFileLocked()
 			return okEnvelope(map[string]any{})
 		}
 
@@ -694,8 +777,10 @@ func handleUsage(payload []byte) ([]byte, error) {
 			acc.DemotedUntil = now.Add(time.Duration(cfg.BaseEjectionMinutes) * time.Minute)
 			acc.DemotedReason = fmt.Sprintf("连续 %d 次上游网关故障(状态码 %d)，触发隔离5h", acc.ConsecutiveFail, rec.Failure.StatusCode)
 			acc.ConsecutiveFail = 0
+			globalState.saveToFileLocked()
 			return okEnvelope(map[string]any{})
 		}
+		globalState.dirty.Store(true)
 		return okEnvelope(map[string]any{})
 	}
 
@@ -727,6 +812,9 @@ func handleUsage(payload []byte) ([]byte, error) {
 			m.TotalRequests++
 		}
 	}
+	globalState.dirty.Store(true)
+
+	return okEnvelope(map[string]any{})
 
 	return okEnvelope(map[string]any{})
 }

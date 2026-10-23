@@ -8,7 +8,7 @@ Combines **Stream-Specialized Per-Model P2C (Power of Two Choices) + Peak-EWMA l
 
 ---
 
-## Architecture Highlights (v0.5.1)
+## Architecture Highlights (v0.5.2)
 
 1. **Stream-Specialized Dual-Track Routing**:
    LLM latency decomposes into $\text{Prefill Time} + (\text{Output Tokens} \times \text{TPOT})$. Non-streaming request duration (0.5s to 25s) is heavily confounded by the number of output tokens requested by the prompt, not backend node congestion.

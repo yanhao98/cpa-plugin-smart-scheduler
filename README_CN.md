@@ -8,7 +8,7 @@
 
 ---
 
-## 核心架构与设计原则（v0.5.1）
+## 核心架构与设计原则（v0.5.2）
 
 ### 1. 流式/非流式双轨制路由（Stream-Specialized Dual Track）
 - **物理本质**：大模型总耗时为 $\text{Prefill Time} + (\text{Output Tokens} \times \text{TPOT})$。非流式请求耗时（0.5s ~ 25s）受用户要求输出的文本长度决定，**绝不能代表节点真实延迟**；
