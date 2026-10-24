@@ -6,13 +6,15 @@ package main
 #include <string.h>
 
 typedef struct {
-	void *data;
+	void *ptr;
 	size_t len;
-	size_t cap;
 } cliproxy_buffer;
 
 typedef struct {
 	uint32_t abi_version;
+	void *host_ctx;
+	void *call;
+	void *free_buffer;
 } cliproxy_host_api;
 
 typedef int (*cliproxy_plugin_call_fn)(const char *op, const uint8_t *in, size_t in_len, cliproxy_buffer *out);
@@ -251,16 +253,14 @@ func cliproxyPluginCall(cOp *C.char, inPtr *C.uint8_t, inLen C.size_t, outBuf *C
 		return 1
 	}
 	if len(res) == 0 {
-		outBuf.data = nil
+		outBuf.ptr = nil
 		outBuf.len = 0
-		outBuf.cap = 0
 		return 0
 	}
 
 	cData := C.CBytes(res)
-	outBuf.data = cData
+	outBuf.ptr = cData
 	outBuf.len = C.size_t(len(res))
-	outBuf.cap = C.size_t(len(res))
 	return 0
 }
 
